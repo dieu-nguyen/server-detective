@@ -1,0 +1,177 @@
+# ============================================================================
+# Windows Server Multi-Service Telegram Debug Agent — Configuration
+# ============================================================================
+# Copy or edit this file as `config.yaml` on your Windows Server.
+# Secrets (TELEGRAM_BOT_TOKEN, MYSQL_PASSWORD, API keys) are loaded from `.env`.
+
+server_name: "prod-win-server-01"
+timezone: "Asia/Saigon"
+
+# ----------------------------------------------------------------------------
+# 1. AGENT ENGINE SWITCH (Dual-Mode Architecture)
+# ----------------------------------------------------------------------------
+# Choose between:
+#   - "cli_subscription": Uses your flat-rate monthly subscription via official
+#                         CLI agent (Cursor CLI default, or Claude / Codex / Gemini).
+#                         Can inspect source code + call `ops_toolkit.py`.
+#   - "sdk_apikey":       Uses direct Python async tool-calling loop over HTTP
+#                         with a pay-as-you-go API key (OpenAI, Anthropic, Gemini,
+#                         OpenRouter, DeepSeek).
+engine:
+  mode: "cli_subscription"          # "cli_subscription" | "sdk_apikey"
+  allow_telegram_mode_switch: true  # Allow admins to run `/mode cli_subscription` or `/mode sdk_apikey`
+  auto_fallback_to_sdk: false       # If true, falls back to sdk_apikey when CLI hits quota/timeout
+  max_history_messages: 10          # Conversation turns kept per Telegram chat/topic
+  audit_log_file: "./audit.jsonl"
+  pending_actions_file: "./.pending_actions.json"
+
+  # --- Mode A: CLI Subscription Configuration ---
+  cli_subscription:
+    # Built-in provider presets: "cursor" | "claude" | "codex" | "gemini" | "custom"
+    provider: "cursor"
+    # Optional model override passed to the CLI (leave empty to use CLI default,
+    # or set e.g. "sonnet-4", "gpt-5", "claude-sonnet-4-20250514")
+    model: ""
+    timeout_seconds: 180
+    max_concurrent_processes: 1     # Protects Windows Server from spawning multiple heavy CLI processes at once
+    # Working directory where CLI runs by default (can also access all service dirs below)
+    default_working_dir: "C:\\Services"
+    # Provider binary overrides (optional; uses sensible defaults per provider if omitted)
+    binaries:
+      cursor: "agent"               # Cursor CLI binary (`agent` or `cursor-agent` or `wsl agent`)
+      claude: "claude"              # Claude Code CLI (`claude`)
+      codex: "codex"                # OpenAI Codex CLI (`codex`)
+      gemini: "gemini"              # Google Gemini CLI (`gemini`)
+    # If provider == "custom", define exact argv template ({prompt} and {system_prompt} are interpolated)
+    custom_command_template: []
+
+  # --- Mode B: SDK API Key Configuration ---
+  sdk_apikey:
+    # Supported providers: "openai" | "anthropic" | "gemini" | "openrouter" | "custom_openai"
+    provider: "anthropic"
+    model: "claude-3-5-haiku-latest"  # Fast/cheap ops model (or "gpt-4.1-mini", "gemini-2.5-flash")
+    api_key_env: "ANTHROPIC_API_KEY"  # Name of env var in .env holding the API key
+    base_url: ""                      # Only needed for "custom_openai" or custom proxy
+    max_tool_turns: 8
+    temperature: 0.1
+
+# ----------------------------------------------------------------------------
+# 2. TELEGRAM & TEAM RBAC (Role-Based Access Control)
+# ----------------------------------------------------------------------------
+telegram:
+  # Allowed Telegram Group Chat IDs (negative numbers for groups/supergroups, e.g. -1001234567890)
+  # Leave empty [] to only allow direct messages from listed admins/viewers.
+  allowed_group_ids:
+    - -1001234567890
+
+  # Admins: Can ask diagnostic questions, switch engine modes, AND click [Approve]
+  #         on state-changing actions (restarting PM2/Windows services, killing hung queries).
+  admins:
+    - 111111111
+    - 222222222
+
+  # Viewers (Teammates): Can ask the agent to debug services, read logs, inspect ngrok/n8n,
+  #                      and run read-only MySQL queries, and can request action buttons
+  #                      (which an Admin must click to approve).
+  viewers:
+    - 333333333
+    - 444444444
+
+  require_mention_in_groups: false  # If true, in group chats bot only replies when @mentioned or replied to
+  action_expiry_seconds: 600        # Pending [Approve] buttons expire after 10 minutes
+
+# ----------------------------------------------------------------------------
+# 3. INFRASTRUCTURE INTEGRATIONS (PM2, ngrok, n8n, MySQL)
+# ----------------------------------------------------------------------------
+integrations:
+  pm2:
+    enabled: true
+    pm2_bin: "pm2"                  # On Windows, usually `pm2` or `pm2.cmd`
+    pm2_home: "C:\\Users\\Administrator\\.pm2"
+    default_log_lines: 100
+
+  ngrok:
+    enabled: true
+    inspector_url: "http://127.0.0.1:4040"
+    win_service_name: "ngrok"       # Optional if ngrok runs as a Windows service or PM2 app
+    pm2_name: "ngrok"
+
+  n8n:
+    enabled: true
+    health_url: "http://127.0.0.1:5678/healthz"
+    pm2_name: "n8n"                 # If n8n is managed by PM2
+    win_service_name: ""            # Or if n8n is a Windows Service
+    working_dir: "C:\\Users\\Administrator\\.n8n"
+    log_paths:
+      - "C:\\Users\\Administrator\\.n8n\\logs\\*.log"
+
+  mysql:
+    enabled: true
+    host: "127.0.0.1"
+    port: 3306
+    user: "ops_agent_ro"            # Strongly recommended: Read-Only MySQL user
+    password_env: "MYSQL_PASSWORD"  # Loaded from .env
+    default_database: "app_production"
+    allowed_databases:
+      - "app_production"
+      - "n8n"
+      - "information_schema"
+    max_rows: 50
+    query_timeout_seconds: 5
+
+# ----------------------------------------------------------------------------
+# 4. MULTI-SERVICE REGISTRY (Python & Node.js Services on Windows Server)
+# ----------------------------------------------------------------------------
+# Register every service running on your Windows Server here so the agent knows
+# where its code, logs, PM2 process, Windows Service, and health check live.
+services:
+  order-api-py:
+    description: "Main Python FastAPI backend handling customer orders and webhooks"
+    runtime: "python"
+    manager: "pm2"                  # "pm2" | "windows_service" | "process"
+    pm2_name: "order-api-py"
+    win_service_name: ""
+    process_match: "uvicorn"
+    working_dir: "C:\\Services\\order-api-py"
+    log_paths:
+      - "C:\\Services\\order-api-py\\logs\\*.log"
+      - "C:\\Users\\Administrator\\.pm2\\logs\\order-api-py-error.log"
+      - "C:\\Users\\Administrator\\.pm2\\logs\\order-api-py-out.log"
+    health_url: "http://127.0.0.1:8000/health"
+    port: 8000
+
+  sync-worker-py:
+    description: "Python background worker syncing jobs with MySQL and external APIs"
+    runtime: "python"
+    manager: "pm2"
+    pm2_name: "sync-worker-py"
+    working_dir: "C:\\Services\\sync-worker-py"
+    log_paths:
+      - "C:\\Services\\sync-worker-py\\logs\\*.log"
+      - "C:\\Users\\Administrator\\.pm2\\logs\\sync-worker-py-error.log"
+    port: null
+
+  billing-service-py:
+    description: "Python Windows Service (NSSM) processing scheduled billing invoices"
+    runtime: "python"
+    manager: "windows_service"
+    win_service_name: "BillingPythonService"
+    process_match: "billing_worker.py"
+    working_dir: "C:\\Services\\billing-service-py"
+    log_paths:
+      - "C:\\Services\\billing-service-py\\logs\\*.log"
+    event_log_source: "BillingPythonService"
+    health_url: "http://127.0.0.1:8010/health"
+    port: 8010
+
+  realtime-gateway-node:
+    description: "Node.js Express/WebSocket gateway receiving external webhooks via ngrok"
+    runtime: "nodejs"
+    manager: "pm2"
+    pm2_name: "realtime-gateway-node"
+    working_dir: "C:\\Services\\realtime-gateway-node"
+    log_paths:
+      - "C:\\Services\\realtime-gateway-node\\logs\\*.log"
+      - "C:\\Users\\Administrator\\.pm2\\logs\\realtime-gateway-node-error.log"
+    health_url: "http://127.0.0.1:3001/health"
+    port: 3001
