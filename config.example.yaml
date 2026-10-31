@@ -8,22 +8,35 @@ server_name: "prod-win-server-01"
 timezone: "Asia/Saigon"
 
 # ----------------------------------------------------------------------------
-# 1. AGENT ENGINE SWITCH (Dual-Mode Architecture)
+# 1. AGENT ENGINE SWITCH & NATIVE SESSION MANAGEMENT
 # ----------------------------------------------------------------------------
 # Choose between:
 #   - "cli_subscription": Uses your flat-rate monthly subscription via official
 #                         CLI agent (Cursor CLI default, or Claude / Codex / Gemini).
-#                         Can inspect source code + call `ops_toolkit.py`.
-#   - "sdk_apikey":       Uses direct Python async tool-calling loop over HTTP
-#                         with a pay-as-you-go API key (OpenAI, Anthropic, Gemini,
-#                         OpenRouter, DeepSeek).
+#   - "sdk_apikey":       Uses an API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.)
+#                         powered by the OpenCode CLI harness (`opencode run --session`),
+#                         Pi CLI (`pi`), or the built-in Python SDK loop.
 engine:
   mode: "cli_subscription"          # "cli_subscription" | "sdk_apikey"
   allow_telegram_mode_switch: true  # Allow admins to run `/mode cli_subscription` or `/mode sdk_apikey`
   auto_fallback_to_sdk: false       # If true, falls back to sdk_apikey when CLI hits quota/timeout
-  max_history_messages: 10          # Conversation turns kept per Telegram chat/topic
+  max_history_messages: 10          # Fallback conversation turns kept per Telegram chat/topic
   audit_log_file: "./audit.jsonl"
   pending_actions_file: "./.pending_actions.json"
+
+  # --- Native Session Lifecycle (When to Resume vs Start a New Chat Session) ---
+  # Because Telegram is a single continuous chat, the bot tracks the native CLI
+  # session_id (Cursor `--resume <id>`, OpenCode `--session <id>`, Claude `--resume <id>`)
+  # and automatically starts a fresh session when any of these conditions occur:
+  #   1. The chat has been idle for > `idle_timeout_minutes` (default 30 mins)
+  #   2. The current session reaches `max_turns_per_session` (default 15 turns)
+  #   3. A user types `/new` (or `/clear`) or clicks the [🔄 New Session] button
+  session:
+    enabled: true
+    sessions_file: "./.sessions.json"
+    idle_timeout_minutes: 30        # Auto-rotate to a fresh session after 30 mins of silence
+    max_turns_per_session: 15       # Auto-rotate after 15 back-and-forth turns
+    show_new_session_button: true   # Attach [🔄 New Session] button to replies
 
   # --- Mode A: CLI Subscription Configuration ---
   cli_subscription:
@@ -36,31 +49,37 @@ engine:
     max_concurrent_processes: 1     # Protects Windows Server from spawning multiple heavy CLI processes at once
     # Working directory where CLI runs by default (can also access all service dirs below)
     default_working_dir: "C:\\Services"
-    # Provider binary overrides (optional; uses sensible defaults per provider if omitted)
     binaries:
       cursor: "agent"               # Cursor CLI binary (`agent` or `cursor-agent` or `wsl agent`)
       claude: "claude"              # Claude Code CLI (`claude`)
       codex: "codex"                # OpenAI Codex CLI (`codex`)
       gemini: "gemini"              # Google Gemini CLI (`gemini`)
-    # If provider == "custom", define exact argv template ({prompt} and {system_prompt} are interpolated)
     custom_command_template: []
 
-  # --- Mode B: SDK API Key Configuration ---
+  # --- Mode B: SDK / API Key Configuration (OpenCode Harness + Python SDK Fallback) ---
   sdk_apikey:
-    # Supported providers: "openai" | "anthropic" | "gemini" | "openrouter" | "custom_openai"
-    provider: "anthropic"
-    model: "claude-3-5-haiku-latest"  # Fast/cheap ops model (or "gpt-4.1-mini", "gemini-2.5-flash")
-    api_key_env: "ANTHROPIC_API_KEY"  # Name of env var in .env holding the API key
-    base_url: ""                      # Only needed for "custom_openai" or custom proxy
+    # Harness choice for API Key mode:
+    #   - "opencode":   Uses OpenCode CLI (`opencode run --format json --session <id>`)
+    #                   with your API key — gives full built-in code reading, grep,
+    #                   and native session continuation.
+    #   - "pi":         Uses Pi coding agent (`pi -p`) with your API key.
+    #   - "python_sdk": Uses the built-in in-memory Python async tool-calling loop.
+    harness: "opencode"             # "opencode" | "pi" | "python_sdk"
+    opencode_bin: "opencode"
+    pi_bin: "pi"
+    provider: "anthropic"           # "openai" | "anthropic" | "gemini" | "openrouter" | "custom_openai"
+    model: "claude-3-5-haiku-latest"
+    api_key_env: "ANTHROPIC_API_KEY"
+    base_url: ""
+    timeout_seconds: 180
     max_tool_turns: 8
     temperature: 0.1
+    auto_fallback_to_python_sdk: true  # Automatically uses in-memory Python SDK if `opencode` is not installed yet
 
 # ----------------------------------------------------------------------------
 # 2. TELEGRAM & TEAM RBAC (Role-Based Access Control)
 # ----------------------------------------------------------------------------
 telegram:
-  # Allowed Telegram Group Chat IDs (negative numbers for groups/supergroups, e.g. -1001234567890)
-  # Leave empty [] to only allow direct messages from listed admins/viewers.
   allowed_group_ids:
     - -1001234567890
 
@@ -70,15 +89,14 @@ telegram:
     - 111111111
     - 222222222
 
-  # Viewers (Teammates): Can ask the agent to debug services, read logs, inspect ngrok/n8n,
-  #                      and run read-only MySQL queries, and can request action buttons
-  #                      (which an Admin must click to approve).
+  # Viewers (Teammates): Can ask the agent to debug services, read logs/code, inspect ngrok/n8n,
+  #                      and run read-only MySQL queries.
   viewers:
     - 333333333
     - 444444444
 
-  require_mention_in_groups: false  # If true, in group chats bot only replies when @mentioned or replied to
-  action_expiry_seconds: 600        # Pending [Approve] buttons expire after 10 minutes
+  require_mention_in_groups: false
+  action_expiry_seconds: 600
 
 # ----------------------------------------------------------------------------
 # 3. INFRASTRUCTURE INTEGRATIONS (PM2, ngrok, n8n, MySQL)
@@ -86,21 +104,21 @@ telegram:
 integrations:
   pm2:
     enabled: true
-    pm2_bin: "pm2"                  # On Windows, usually `pm2` or `pm2.cmd`
+    pm2_bin: "pm2"
     pm2_home: "C:\\Users\\Administrator\\.pm2"
     default_log_lines: 100
 
   ngrok:
     enabled: true
     inspector_url: "http://127.0.0.1:4040"
-    win_service_name: "ngrok"       # Optional if ngrok runs as a Windows service or PM2 app
+    win_service_name: "ngrok"
     pm2_name: "ngrok"
 
   n8n:
     enabled: true
     health_url: "http://127.0.0.1:5678/healthz"
-    pm2_name: "n8n"                 # If n8n is managed by PM2
-    win_service_name: ""            # Or if n8n is a Windows Service
+    pm2_name: "n8n"
+    win_service_name: ""
     working_dir: "C:\\Users\\Administrator\\.n8n"
     log_paths:
       - "C:\\Users\\Administrator\\.n8n\\logs\\*.log"
@@ -109,8 +127,8 @@ integrations:
     enabled: true
     host: "127.0.0.1"
     port: 3306
-    user: "ops_agent_ro"            # Strongly recommended: Read-Only MySQL user
-    password_env: "MYSQL_PASSWORD"  # Loaded from .env
+    user: "ops_agent_ro"
+    password_env: "MYSQL_PASSWORD"
     default_database: "app_production"
     allowed_databases:
       - "app_production"
@@ -120,19 +138,29 @@ integrations:
     query_timeout_seconds: 5
 
 # ----------------------------------------------------------------------------
-# 4. MULTI-SERVICE REGISTRY (Python & Node.js Services on Windows Server)
+# 4. MULTI-SERVICE REGISTRY (Multiple Action Logs + Source Code Directories)
 # ----------------------------------------------------------------------------
-# Register every service running on your Windows Server here so the agent knows
-# where its code, logs, PM2 process, Windows Service, and health check live.
+# Each service can define:
+#   - `working_dir`: Where the service's source code lives (for code search & reading)
+#   - `logs_dir`:    Directory containing multiple action-specific log files
+#   - `log_files`:   Named action log map (e.g. auth, payment, webhook, error)
+#   - `log_paths`:   Additional log file globs (such as PM2 out/error logs)
 services:
   order-api-py:
-    description: "Main Python FastAPI backend handling customer orders and webhooks"
+    description: "Main Python FastAPI backend handling customer orders, payments, and webhooks"
     runtime: "python"
-    manager: "pm2"                  # "pm2" | "windows_service" | "process"
+    manager: "pm2"
     pm2_name: "order-api-py"
     win_service_name: ""
     process_match: "uvicorn"
     working_dir: "C:\\Services\\order-api-py"
+    logs_dir: "C:\\Services\\order-api-py\\logs"
+    log_files:
+      app: "C:\\Services\\order-api-py\\logs\\app.log"
+      payment: "C:\\Services\\order-api-py\\logs\\payment*.log"
+      webhook: "C:\\Services\\order-api-py\\logs\\webhook*.log"
+      auth: "C:\\Services\\order-api-py\\logs\\auth*.log"
+      error: "C:\\Services\\order-api-py\\logs\\error*.log"
     log_paths:
       - "C:\\Services\\order-api-py\\logs\\*.log"
       - "C:\\Users\\Administrator\\.pm2\\logs\\order-api-py-error.log"
@@ -146,6 +174,12 @@ services:
     manager: "pm2"
     pm2_name: "sync-worker-py"
     working_dir: "C:\\Services\\sync-worker-py"
+    logs_dir: "C:\\Services\\sync-worker-py\\logs"
+    log_files:
+      scheduler: "C:\\Services\\sync-worker-py\\logs\\scheduler*.log"
+      mysql_sync: "C:\\Services\\sync-worker-py\\logs\\mysql_sync*.log"
+      retry_queue: "C:\\Services\\sync-worker-py\\logs\\retry_queue*.log"
+      error: "C:\\Services\\sync-worker-py\\logs\\error*.log"
     log_paths:
       - "C:\\Services\\sync-worker-py\\logs\\*.log"
       - "C:\\Users\\Administrator\\.pm2\\logs\\sync-worker-py-error.log"
@@ -158,6 +192,11 @@ services:
     win_service_name: "BillingPythonService"
     process_match: "billing_worker.py"
     working_dir: "C:\\Services\\billing-service-py"
+    logs_dir: "C:\\Services\\billing-service-py\\logs"
+    log_files:
+      invoice_gen: "C:\\Services\\billing-service-py\\logs\\invoice*.log"
+      tax_sync: "C:\\Services\\billing-service-py\\logs\\tax*.log"
+      error: "C:\\Services\\billing-service-py\\logs\\error*.log"
     log_paths:
       - "C:\\Services\\billing-service-py\\logs\\*.log"
     event_log_source: "BillingPythonService"
@@ -170,6 +209,11 @@ services:
     manager: "pm2"
     pm2_name: "realtime-gateway-node"
     working_dir: "C:\\Services\\realtime-gateway-node"
+    logs_dir: "C:\\Services\\realtime-gateway-node\\logs"
+    log_files:
+      websocket: "C:\\Services\\realtime-gateway-node\\logs\\websocket*.log"
+      incoming_webhook: "C:\\Services\\realtime-gateway-node\\logs\\webhook*.log"
+      error: "C:\\Services\\realtime-gateway-node\\logs\\error*.log"
     log_paths:
       - "C:\\Services\\realtime-gateway-node\\logs\\*.log"
       - "C:\\Users\\Administrator\\.pm2\\logs\\realtime-gateway-node-error.log"

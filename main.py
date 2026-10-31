@@ -28,8 +28,21 @@ def run_preflight_check(config_path: str) -> int:
         "server_name": cfg.server_name,
         "active_engine_mode": cfg.engine.mode,
         "cli_subscription_provider": cfg.engine.cli_subscription.provider,
+        "sdk_apikey_harness": cfg.engine.sdk_apikey.harness,
         "sdk_apikey_provider": f"{cfg.engine.sdk_apikey.provider}:{cfg.engine.sdk_apikey.model}",
-        "registered_services": list(cfg.services.keys()),
+        "session_lifecycle": {
+            "enabled": cfg.engine.session.enabled,
+            "idle_timeout_minutes": cfg.engine.session.idle_timeout_minutes,
+            "max_turns_per_session": cfg.engine.session.max_turns_per_session,
+        },
+        "registered_services": {
+            name: {
+                "working_dir": svc.working_dir,
+                "logs_dir": svc.logs_dir,
+                "log_categories": list(svc.log_files.keys()),
+            }
+            for name, svc in cfg.services.items()
+        },
         "admins_count": len(cfg.telegram.admins),
         "viewers_count": len(cfg.telegram.viewers),
         "system_snapshot": {
@@ -64,10 +77,11 @@ def main() -> int:
     bot = TelegramOpsBot(cfg)
     app = bot.build_application()
     logging.info(
-        "Starting Telegram Server Debug Agent for '%s' in mode='%s' (CLI provider='%s', SDK provider='%s')...",
+        "Starting Telegram Server Debug Agent for '%s' in mode='%s' (CLI='%s', SDK='%s/%s')...",
         cfg.server_name,
         cfg.engine.mode,
         cfg.engine.cli_subscription.provider,
+        cfg.engine.sdk_apikey.harness,
         cfg.engine.sdk_apikey.provider,
     )
     app.run_polling(drop_pending_updates=True)

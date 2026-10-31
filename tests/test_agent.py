@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-import os
+import json
+import time
 from pathlib import Path
 
 import pytest
 
-from agent.config import load_config, save_engine_mode_to_config
+from agent.config import ServiceDefinition, load_config, save_engine_mode_to_config
 from agent.engines.cli_subscription import CLISubscriptionEngine
 from agent.engines.router import EngineRouter
+from agent.engines.sdk_apikey import SDKApiKeyEngine
 from agent.security import redact_secrets, validate_readonly_sql
+from agent.session_manager import SessionManager, parse_cli_json_output
 from ops_toolkit import OpsToolkit
 
 
@@ -19,8 +22,12 @@ def test_config_loads_and_validates() -> None:
     assert cfg.server_name == "prod-win-server-01"
     assert cfg.engine.mode == "cli_subscription"
     assert cfg.engine.cli_subscription.provider == "cursor"
+    assert cfg.engine.sdk_apikey.harness == "opencode"
+    assert cfg.engine.session.idle_timeout_minutes == 30
+    assert cfg.engine.session.max_turns_per_session == 15
     assert "order-api-py" in cfg.services
-    assert "realtime-gateway-node" in cfg.services
+    assert "payment" in cfg.services["order-api-py"].log_files
+    assert "webhook" in cfg.services["order-api-py"].log_files
     assert cfg.is_admin(111111111)
     assert not cfg.is_admin(333333333)
     assert cfg.is_viewer(333333333)
@@ -59,52 +66,156 @@ def test_secret_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "[REDACTED" in cleaned
 
 
-def test_cli_subscription_command_builders(tmp_path: Path) -> None:
+def test_cli_subscription_and_opencode_command_builders_with_sessions(tmp_path: Path) -> None:
     cfg = load_config("config.yaml")
     cfg.engine.pending_actions_file = str(tmp_path / "pending.json")
     tk = OpsToolkit(cfg)
-    engine = CLISubscriptionEngine(cfg, tk)
+    cli_engine = CLISubscriptionEngine(cfg, tk)
+    sdk_engine = SDKApiKeyEngine(cfg, tk)
 
-    # Default Cursor CLI preset
-    cmd_cursor = engine.build_command("check order-api-py")
-    assert "-p" in cmd_cursor
-    assert "check order-api-py" in cmd_cursor
+    # 1. Cursor CLI fresh vs resumed session
+    cmd_cursor_new = cli_engine.build_command("check order-api-py", resume_session_id=None)
+    assert "--output-format" in cmd_cursor_new
+    assert "json" in cmd_cursor_new
+    assert "--resume" not in cmd_cursor_new
 
-    # Switch to Claude CLI preset
-    cfg.engine.cli_subscription.provider = "claude"
-    cfg.engine.cli_subscription.model = "sonnet"
-    cmd_claude = engine.build_command("check logs")
-    assert cmd_claude[0] == "claude"
-    assert "--model" in cmd_claude
+    cmd_cursor_resume = cli_engine.build_command("check payment log", resume_session_id="chat_abc123")
+    assert "--resume" in cmd_cursor_resume
+    assert "chat_abc123" in cmd_cursor_resume
 
-    # Switch to Codex CLI preset
-    cfg.engine.cli_subscription.provider = "codex"
-    cmd_codex = engine.build_command("inspect db")
-    assert cmd_codex[:2] == ["codex", "exec"]
+    # 2. OpenCode CLI (`sdk_apikey` mode) fresh vs resumed session
+    cmd_oc_new = sdk_engine.build_opencode_command("inspect logs", resume_session_id=None)
+    assert cmd_oc_new[:2] == ["opencode", "run"]
+    assert "--format" in cmd_oc_new
+    assert "--session" not in cmd_oc_new
+
+    cmd_oc_resume = sdk_engine.build_opencode_command("follow up", resume_session_id="ses_xyz789")
+    assert "--session" in cmd_oc_resume
+    assert "ses_xyz789" in cmd_oc_resume
 
 
-def test_ops_toolkit_and_gated_action_queue(tmp_path: Path) -> None:
-    cfg = load_config("config.yaml")
-    cfg.engine.pending_actions_file = str(tmp_path / "pending.json")
-    tk = OpsToolkit(cfg)
+def test_session_manager_lifecycle_and_auto_rotation(tmp_path: Path) -> None:
+    sess_file = tmp_path / "sessions.json"
+    mgr = SessionManager(sessions_file=sess_file, idle_timeout_minutes=30, max_turns_per_session=3)
 
-    sys_res = tk.get_system_resources()
-    assert "cpu_percent" in sys_res
-    assert "memory" in sys_res
+    # Turn 1: New session
+    st1 = mgr.resolve_session("-100123:main", "cli_subscription:cursor")
+    assert st1.is_new_session is True
+    assert st1.native_session_id is None
+    st1_saved = mgr.record_turn(st1, "ses_native_001")
+    assert st1_saved.turn_count == 1
+    assert st1_saved.native_session_id == "ses_native_001"
 
-    proposed = tk.propose_action(
-        action_type="pm2_restart",
-        target="order-api-py",
-        reason="High memory usage",
-        requested_by_user_id=333333333,
-        requested_by_username="dev_user",
+    # Turn 2: Active follow-up resumes `ses_native_001`
+    st2 = mgr.resolve_session("-100123:main", "cli_subscription:cursor")
+    assert st2.is_new_session is False
+    assert st2.native_session_id == "ses_native_001"
+    mgr.record_turn(st2, "ses_native_001")
+
+    # Turn 3: Reaches max_turns=3
+    st3 = mgr.resolve_session("-100123:main", "cli_subscription:cursor")
+    mgr.record_turn(st3, "ses_native_001")
+
+    # Turn 4: Exceeds max_turns_per_session (3) -> Auto-rotates to a brand new session!
+    st4 = mgr.resolve_session("-100123:main", "cli_subscription:cursor")
+    assert st4.is_new_session is True
+    assert st4.native_session_id is None
+    assert "max_turns_reached" in st4.rotation_reason
+
+    # Test idle timeout auto-rotation
+    mgr.record_turn(st4, "ses_native_002")
+    raw = json.loads(sess_file.read_text(encoding="utf-8"))
+    raw["-100123:main"]["cli_subscription:cursor"]["last_active_at"] = time.time() - (45 * 60)
+    sess_file.write_text(json.dumps(raw), encoding="utf-8")
+
+    st_idle = mgr.resolve_session("-100123:main", "cli_subscription:cursor")
+    assert st_idle.is_new_session is True
+    assert st_idle.native_session_id is None
+    assert "idle_timeout" in st_idle.rotation_reason
+
+
+def test_parse_cli_json_output_formats() -> None:
+    # 1. Cursor / Claude single JSON output
+    cursor_raw = json.dumps({"type": "result", "result": "Root cause is DB timeout", "session_id": "cur_999"})
+    ans1, sid1 = parse_cli_json_output(cursor_raw)
+    assert ans1 == "Root cause is DB timeout"
+    assert sid1 == "cur_999"
+
+    # 2. OpenCode JSONL streaming event output
+    opencode_raw = "\n".join(
+        [
+            json.dumps({"type": "step_start", "sessionID": "ses_open_42"}),
+            json.dumps({"type": "text", "sessionID": "ses_open_42", "part": {"text": "Checked payment.log. "}}),
+            json.dumps({"type": "text", "sessionID": "ses_open_42", "part": {"text": "Found 502 on line 88."}}),
+        ]
     )
-    assert proposed["ok"] is True
-    action_id = proposed["action"]["action_id"]
+    ans2, sid2 = parse_cli_json_output(opencode_raw)
+    assert "Checked payment.log. Found 502 on line 88." == ans2
+    assert sid2 == "ses_open_42"
 
-    pending_list = tk.action_store.list_pending()
-    assert len(pending_list) == 1
-    assert pending_list[0]["action_id"] == action_id
+
+def test_multi_file_action_logs_and_source_code_tools(tmp_path: Path) -> None:
+    svc_dir = tmp_path / "order-service"
+    logs_dir = svc_dir / "logs"
+    logs_dir.mkdir(parents=True)
+
+    # Create multiple action log files
+    (logs_dir / "payment.log").write_text("INFO Payment started\nERROR Payment gateway timeout order=77\n")
+    (logs_dir / "webhook.log").write_text("INFO Webhook received event=invoice.paid\n")
+    (logs_dir / "auth.log").write_text("WARN Invalid JWT token from 10.0.0.4\n")
+
+    # Create source code file and a secret .env file
+    (svc_dir / "handler.py").write_text(
+        "def process_payment(order_id):\n"
+        "    if not order_id:\n"
+        "        raise ValueError('Missing order_id')\n"
+        "    return True\n"
+    )
+    (svc_dir / ".env").write_text("SECRET_KEY=do_not_read_me\n")
+
+    cfg = load_config("config.yaml")
+    cfg.services["test-svc"] = ServiceDefinition(
+        name="test-svc",
+        runtime="python",
+        manager="pm2",
+        working_dir=str(svc_dir),
+        logs_dir=str(logs_dir),
+        log_files={
+            "payment": str(logs_dir / "payment*.log"),
+            "webhook": str(logs_dir / "webhook*.log"),
+            "auth": str(logs_dir / "auth*.log"),
+        },
+    )
+    tk = OpsToolkit(cfg)
+
+    # 1. List all log files
+    listed = tk.list_service_log_files("test-svc")
+    assert listed["ok"] is True
+    assert listed["total_files_found"] == 3
+
+    # 2. Read specific action log (`payment`)
+    pay_logs = tk.get_service_logs("test-svc", category_or_file="payment", filter_keyword="ERROR")
+    assert pay_logs["ok"] is True
+    assert pay_logs["matched_files_count"] == 1
+    only_log = next(iter(pay_logs["logs"].values()))
+    assert "Payment gateway timeout order=77" in only_log["tail"]
+
+    # 3. Search source code
+    code_search = tk.search_service_code("test-svc", query="process_payment")
+    assert code_search["ok"] is True
+    assert len(code_search["matches"]) == 1
+    assert code_search["matches"][0]["file"] == "handler.py"
+
+    # 4. Read source code file with line numbers
+    code_read = tk.read_service_code_file("test-svc", relative_path="handler.py", start_line=1, end_line=4)
+    assert code_read["ok"] is True
+    assert "process_payment" in code_read["content"]
+
+    # 5. Ensure reading `.env` or traversing outside `working_dir` is blocked
+    blocked_env = tk.read_service_code_file("test-svc", relative_path=".env")
+    assert blocked_env["ok"] is False
+    blocked_traversal = tk.read_service_code_file("test-svc", relative_path="../../etc/passwd")
+    assert blocked_traversal["ok"] is False
 
 
 def test_router_mode_switch_persistence(tmp_path: Path) -> None:

@@ -1,5 +1,6 @@
 """
 Telegram Gateway with Team Role-Based Access Control (RBAC), Mode Switching,
+Native Session Lifecycle Controls (`/new`, `/session`, `[🔄 New Session]` button),
 Audit Logging, and Interactive Admin Approval Buttons.
 """
 
@@ -8,7 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from typing import Any, Dict, List, Optional
+import time
+from typing import List, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -58,8 +60,18 @@ def build_approval_keyboard(action_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def build_session_footer_keyboard(session_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔄 Start New Session", callback_data=f"new_session:{session_key}"),
+            ]
+        ]
+    )
+
+
 class TelegramOpsBot:
-    """Telegram Bot wrapping `EngineRouter`, `OpsToolkit`, and team RBAC."""
+    """Telegram Bot wrapping `EngineRouter`, `OpsToolkit`, Native Session Manager, and Team RBAC."""
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -106,23 +118,27 @@ class TelegramOpsBot:
         role = "Admin" if (user and self.config.is_admin(user.id)) else "Viewer"
         mode = self.router.current_mode
         sub_provider = self.config.engine.cli_subscription.provider
-        sdk_provider = f"{self.config.engine.sdk_apikey.provider}:{self.config.engine.sdk_apikey.model}"
+        sdk_cfg = self.config.engine.sdk_apikey
+        sdk_provider = f"{sdk_cfg.harness} ({sdk_cfg.provider}/{sdk_cfg.model})"
+        sess_cfg = self.config.engine.session
 
         msg = (
             f"🖥️ **{self.config.server_name} — Server Debug Agent**\n"
             f"• **Your Role:** `{role}` (ID: `{user.id if user else ''}`)\n"
             f"• **Active Engine Mode:** `{mode}`\n"
             f"• **CLI Subscription Provider:** `{sub_provider}`\n"
-            f"• **SDK API Key Provider:** `{sdk_provider}`\n"
+            f"• **SDK API Key Harness:** `{sdk_provider}`\n"
+            f"• **Session Auto-Rotation:** Idle > `{sess_cfg.idle_timeout_minutes}m` or > `{sess_cfg.max_turns_per_session}` turns\n"
             f"• **Registered Services:** `{', '.join(self.config.services.keys()) or 'None'}`\n\n"
             "**Commands:**\n"
-            "• Ask any question in natural language to debug services, logs, PM2, ngrok, n8n, or MySQL.\n"
+            "• Ask any question in natural language to debug services, multi-file logs, source code, PM2, ngrok, n8n, or MySQL.\n"
+            "• `/new` (or `/clear`) — Start a brand-new native debugging session\n"
+            "• `/session` — Inspect active native session ID, turn count, and idle timer\n"
             "• `/status` — Quick snapshot of system resources & all registered services\n"
-            "• `/services` — List all configured services & health endpoints\n"
+            "• `/services` — List all configured services, action log categories, & code paths\n"
             "• `/mode` — View or switch engine (`cli_subscription` | `sdk_apikey`)\n"
             "• `/cli <question>` — Force a single turn through CLI Subscription mode\n"
-            "• `/sdk <question>` — Force a single turn through SDK API Key mode\n"
-            "• `/clear` — Clear conversation memory for this chat/topic"
+            "• `/sdk <question>` — Force a single turn through SDK API Key mode"
         )
         if update.effective_message:
             await update.effective_message.reply_text(msg)
@@ -153,7 +169,8 @@ class TelegramOpsBot:
             hc = s_info.get("health_check") or {}
             hc_str = f"HTTP {hc.get('status_code')}" if hc.get("reachable") else ("UNREACHABLE" if hc else "N/A")
             state_str = pm2_state or win_state or "configured"
-            lines.append(f"• `{s_name}` ({s_info.get('manager')}): state=`{state_str}`, health=`{hc_str}`")
+            cats = ", ".join(s_info.get("log_categories") or []) or "default"
+            lines.append(f"• `{s_name}` ({s_info.get('manager')}): state=`{state_str}`, health=`{hc_str}`, logs=`[{cats}]`")
 
         await update.effective_message.reply_text("\n".join(lines))
 
@@ -176,11 +193,12 @@ class TelegramOpsBot:
             return
 
         args = context.args or []
+        sdk_cfg = self.config.engine.sdk_apikey
         if not args:
             await update.effective_message.reply_text(
                 f"⚙️ **Current Engine Mode:** `{self.router.current_mode}`\n"
                 f"• CLI Subscription provider: `{self.config.engine.cli_subscription.provider}`\n"
-                f"• SDK API Key provider: `{self.config.engine.sdk_apikey.provider}` (`{self.config.engine.sdk_apikey.model}`)\n\n"
+                f"• SDK API Key harness: `{sdk_cfg.harness}` (`{sdk_cfg.provider}/{sdk_cfg.model}`)\n\n"
                 "Admins can switch modes with:\n"
                 "• `/mode cli_subscription` (or `/mode cli`)\n"
                 "• `/mode sdk_apikey` (or `/mode sdk`)"
@@ -210,13 +228,54 @@ class TelegramOpsBot:
         except ValueError as exc:
             await update.effective_message.reply_text(f"❌ {exc}")
 
-    async def cmd_clear(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def cmd_new_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Start a brand-new native debugging session (`/new` or `/clear`)."""
         if not self._check_access(update):
             await self._deny_access(update)
             return
-        self.router.memory.clear(self._session_key(update))
+        s_key = self._session_key(update)
+        self.router.reset_session(s_key)
         if update.effective_message:
-            await update.effective_message.reply_text("🧹 Conversation memory cleared for this chat.")
+            await update.effective_message.reply_text(
+                "🆕 **Started a fresh debugging session** for this chat/topic.\n"
+                "Your next message will begin a clean native session (`turn 1`)."
+            )
+
+    async def cmd_session_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Inspect active native CLI session IDs, turn counts, and idle timers for this chat."""
+        if not self._check_access(update):
+            await self._deny_access(update)
+            return
+        if not update.effective_message:
+            return
+
+        s_key = self._session_key(update)
+        info = self.router.get_session_status(s_key)
+        sess_cfg = self.config.engine.session
+        if not info:
+            await update.effective_message.reply_text(
+                f"ℹ️ **No active native session** for `{s_key}`.\n"
+                f"• Auto-expiry policy: `{sess_cfg.idle_timeout_minutes}m` idle or `{sess_cfg.max_turns_per_session}` max turns."
+            )
+            return
+
+        now = time.time()
+        lines = [
+            f"🧵 **Active Native Sessions for `{s_key}`**",
+            f"• Policy: Auto-rotates after `{sess_cfg.idle_timeout_minutes}m` idle or `{sess_cfg.max_turns_per_session}` turns.",
+        ]
+        for prov_key, rec in info.items():
+            idle_mins = round((now - float(rec.get("last_active_at", now))) / 60, 1)
+            lines.append(
+                f"\n**Provider `{prov_key}`:**\n"
+                f"  • Native Session ID: `{rec.get('native_session_id') or 'in-memory'}`\n"
+                f"  • Turns used: `{rec.get('turn_count', 0)} / {sess_cfg.max_turns_per_session}`\n"
+                f"  • Idle time: `{idle_mins}m` (expires at `{sess_cfg.idle_timeout_minutes}m`)"
+            )
+        await update.effective_message.reply_text(
+            "\n".join(lines),
+            reply_markup=build_session_footer_keyboard(s_key),
+        )
 
     async def cmd_force_cli(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         prompt = " ".join(context.args or []).strip()
@@ -244,7 +303,6 @@ class TelegramOpsBot:
 
         text = update.effective_message.text.strip()
         chat = update.effective_chat
-        # Optional mention check in group chats
         if chat and chat.id < 0 and self.config.telegram.require_mention_in_groups:
             bot_username = context.bot.username or ""
             is_reply_to_bot = (
@@ -269,6 +327,7 @@ class TelegramOpsBot:
         if not msg or not user or not chat:
             return
 
+        s_key = self._session_key(update)
         active_mode = override_mode or self.router.current_mode
         self.audit.log(
             event_type="debug_question",
@@ -276,7 +335,7 @@ class TelegramOpsBot:
             username=user.username or "",
             chat_id=chat.id,
             engine_mode=active_mode,
-            details={"question": redact_secrets(question)},
+            details={"question": redact_secrets(question), "session_key": s_key},
         )
 
         status_msg = await msg.reply_text(
@@ -289,7 +348,7 @@ class TelegramOpsBot:
 
         try:
             result = await self.router.handle_message(
-                session_key=self._session_key(update),
+                session_key=s_key,
                 user_message=question,
                 requester_user_id=user.id,
                 requester_username=user.username or user.first_name or str(user.id),
@@ -300,13 +359,35 @@ class TelegramOpsBot:
             await status_msg.edit_text(f"❌ **Agent Error (`{active_mode}`):**\n{err_text}")
             return
 
-        header = f"🤖 **[{result.engine_used} • {result.provider_used}]**\n\n"
+        max_turns = self.config.engine.session.max_turns_per_session
+        sid_short = (result.native_session_id or "mem")[:10]
+        if result.is_new_session:
+            reason_note = (
+                f" — auto-rotated: {result.session_rotation_reason}"
+                if result.session_rotation_reason not in ("", "first_turn")
+                else ""
+            )
+            session_badge = f"🆕 Session `{sid_short}` (Turn {result.session_turn}/{max_turns}{reason_note})"
+        else:
+            session_badge = f"🔗 Resumed `{sid_short}` (Turn {result.session_turn}/{max_turns})"
+
+        header = f"🤖 **[{result.engine_used} • {result.provider_used}]**\n{session_badge}\n\n"
         full_reply = header + result.answer
         chunks = split_telegram_message(full_reply)
 
-        await status_msg.edit_text(chunks[0])
-        for extra_chunk in chunks[1:]:
-            await msg.reply_text(extra_chunk)
+        footer_markup = (
+            build_session_footer_keyboard(s_key)
+            if self.config.engine.session.show_new_session_button
+            else None
+        )
+
+        if len(chunks) == 1:
+            await status_msg.edit_text(chunks[0], reply_markup=footer_markup)
+        else:
+            await status_msg.edit_text(chunks[0])
+            for extra_chunk in chunks[1:-1]:
+                await msg.reply_text(extra_chunk)
+            await msg.reply_text(chunks[-1], reply_markup=footer_markup)
 
         # Render interactive [Approve] / [Reject] buttons for any gated actions queued during the turn
         for action in result.pending_actions:
@@ -325,7 +406,7 @@ class TelegramOpsBot:
             )
 
     # -------------------------------------------------------------------------
-    # Callback Query Handler for Admin Approval Buttons
+    # Callback Query Handler (New Session Button + Admin Approval Buttons)
     # -------------------------------------------------------------------------
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -333,6 +414,29 @@ class TelegramOpsBot:
             return
 
         user = query.from_user
+        parts = query.data.split(":", 1)
+        if len(parts) != 2:
+            await query.answer("Invalid callback data.")
+            return
+
+        decision, payload = parts[0], parts[1]
+
+        # Any authorized viewer/admin can start a new session
+        if decision == "new_session":
+            chat_id = update.effective_chat.id if update.effective_chat else 0
+            if not self.config.is_authorized(user.id, chat_id):
+                await query.answer("⛔ Unauthorized.", show_alert=True)
+                return
+            self.router.reset_session(payload)
+            await query.answer("Started a fresh debugging session!")
+            if query.message:
+                await query.message.reply_text(
+                    f"🆕 **New session started** by @{user.username or user.id}. "
+                    "The next question will start with a clean context (`turn 1`)."
+                )
+            return
+
+        # Only Admins can approve or reject state-changing server actions
         if not self.config.is_admin(user.id):
             await query.answer("⛔ Only Admins listed in config.yaml can approve or reject actions.", show_alert=True)
             self.audit.log(
@@ -343,12 +447,7 @@ class TelegramOpsBot:
             )
             return
 
-        parts = query.data.split(":", 1)
-        if len(parts) != 2:
-            await query.answer("Invalid callback data.")
-            return
-
-        decision, action_id = parts[0], parts[1]
+        action_id = payload
         if decision == "reject":
             removed = self.toolkit.action_store.pop_action(action_id)
             self.audit.log(
@@ -393,7 +492,9 @@ class TelegramOpsBot:
         app.add_handler(CommandHandler("status", self.cmd_status))
         app.add_handler(CommandHandler("services", self.cmd_services))
         app.add_handler(CommandHandler("mode", self.cmd_mode))
-        app.add_handler(CommandHandler("clear", self.cmd_clear))
+        app.add_handler(CommandHandler("new", self.cmd_new_session))
+        app.add_handler(CommandHandler("clear", self.cmd_new_session))
+        app.add_handler(CommandHandler("session", self.cmd_session_info))
         app.add_handler(CommandHandler("cli", self.cmd_force_cli))
         app.add_handler(CommandHandler("sdk", self.cmd_force_sdk))
         app.add_handler(CallbackQueryHandler(self.handle_callback_query))

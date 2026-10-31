@@ -2,18 +2,19 @@
 Shared Windows Server Operations Toolkit (`ops_toolkit.py`).
 
 Used by BOTH:
-1. `sdk_apikey` mode — imported directly in Python as async/sync tool functions.
+1. `sdk_apikey` mode — via OpenCode (`opencode run`) or imported directly in Python.
 2. `cli_subscription` mode — invoked via CLI (`python ops_toolkit.py <tool> ...`) or imported.
 
-All read/diagnostic tools are safe to run automatically.
-Any state-changing operation (restarting PM2/Windows services, killing hung queries)
-is NEVER executed directly by the LLM; instead, `propose_action` registers a pending
-approval request that requires a Telegram Admin to click [Approve].
+Supports:
+- Multi-file action logs per service (`list_service_log_files` + `get_service_logs` across named log categories or all log files)
+- Source code inspection (`search_service_code` + `read_service_code_file` jailed inside `working_dir`)
+- PM2, ngrok, n8n, Windows Services / Event Viewer, Read-Only MySQL, and Gated Admin Approvals.
 """
 
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import glob
 import json
 import os
@@ -22,14 +23,28 @@ import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import httpx
 import psutil
 
 from agent.config import AppConfig, ServiceDefinition, load_config
 from agent.security import redact_secrets, validate_readonly_sql
+
+IGNORED_CODE_DIRS = {
+    ".git",
+    "node_modules",
+    ".venv",
+    "venv",
+    "env",
+    "__pycache__",
+    ".pytest_cache",
+    "dist",
+    "build",
+    ".next",
+}
 
 
 def _run_cmd(
@@ -97,7 +112,6 @@ class PendingActionStore:
         try:
             data = json.loads(self.file_path.read_text(encoding="utf-8"))
             now = time.time()
-            # Prune expired actions
             return {
                 k: v
                 for k, v in data.items()
@@ -148,7 +162,7 @@ class PendingActionStore:
 
 
 class OpsToolkit:
-    """Unified diagnostic & gated-action toolkit for Windows Server + PM2 + ngrok + n8n + MySQL."""
+    """Unified diagnostic, multi-log, source-code, and gated-action toolkit for Windows Server."""
 
     ALLOWED_ACTION_TYPES = (
         "pm2_restart",
@@ -234,7 +248,7 @@ class OpsToolkit:
     # 2. MULTI-SERVICE REGISTRY OVERVIEW
     # -------------------------------------------------------------------------
     def list_registered_services_status(self) -> Dict[str, Any]:
-        """Check status, health URL, port, and process state of all services in config.yaml."""
+        """Check status, health URL, port, log categories, and process state of all services in config.yaml."""
         pm2_map: Dict[str, Dict[str, Any]] = {}
         if self.config.integrations.pm2.enabled:
             pm2_data = self.get_pm2_status()
@@ -249,6 +263,8 @@ class OpsToolkit:
                 "runtime": svc.runtime,
                 "manager": svc.manager,
                 "working_dir": svc.working_dir,
+                "logs_dir": svc.logs_dir,
+                "log_categories": list(svc.log_files.keys()),
                 "port": svc.port,
             }
             if svc.manager == "pm2" and svc.pm2_name:
@@ -366,7 +382,6 @@ class OpsToolkit:
         if found_logs:
             return {"ok": True, "app_name": app_name, "source": "pm2_log_files", "logs": found_logs}
 
-        # Fallback to `pm2 logs <app> --lines N --nostream`
         pm2_bin = self.config.integrations.pm2.pm2_bin
         is_win = platform.system().lower().startswith("win")
         res = _run_cmd([pm2_bin, "logs", app_name, "--lines", str(lines), "--nostream"], timeout=15, shell=is_win)
@@ -378,15 +393,64 @@ class OpsToolkit:
         }
 
     # -------------------------------------------------------------------------
-    # 4. SERVICE FILE LOGS & WINDOWS SERVICES / EVENT VIEWER
+    # 4. MULTI-FILE ACTION LOG DISCOVERY & READING
     # -------------------------------------------------------------------------
-    def get_service_logs(
-        self,
-        service_name: str,
-        lines: int = 100,
-        filter_keyword: str = "",
-    ) -> Dict[str, Any]:
-        """Read latest log lines for a registered service in `config.yaml` (supports wildcards `*.log`)."""
+    def _discover_service_log_paths(self, svc: ServiceDefinition) -> List[Dict[str, Any]]:
+        """Discover all log files for a service across `log_files`, `logs_dir`, and `log_paths`."""
+        seen_paths: Set[str] = set()
+        entries: List[Dict[str, Any]] = []
+
+        def _add_file(fpath: Path, category: str) -> None:
+            try:
+                resolved = str(fpath.resolve())
+            except Exception:
+                resolved = str(fpath)
+            if resolved in seen_paths or not fpath.exists() or not fpath.is_file():
+                return
+            seen_paths.add(resolved)
+            try:
+                stat = fpath.stat()
+                entries.append(
+                    {
+                        "category": category,
+                        "filename": fpath.name,
+                        "path": str(fpath),
+                        "size_kb": round(stat.st_size / 1024, 1),
+                        "modified_utc": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                        "mtime": stat.st_mtime,
+                    }
+                )
+            except Exception:
+                pass
+
+        # 1. Named action log categories (`log_files` map in config.yaml)
+        for cat_name, pattern in svc.log_files.items():
+            for p_str in glob.glob(pattern):
+                _add_file(Path(p_str), category=cat_name)
+
+        # 2. All `.log` / `.txt` files inside `logs_dir` (including subdirectories)
+        if svc.logs_dir and Path(svc.logs_dir).exists():
+            logs_root = Path(svc.logs_dir)
+            for ext in ("*.log", "*.log.*", "*.txt", "*.jsonl"):
+                for p in logs_root.rglob(ext):
+                    _add_file(p, category=p.stem.split(".")[0])
+
+        # 3. General `log_paths` globs
+        for pattern in svc.log_paths:
+            for p_str in glob.glob(pattern):
+                p = Path(p_str)
+                _add_file(p, category=p.stem.split(".")[0])
+
+        entries.sort(key=lambda x: x.get("mtime", 0), reverse=True)
+        for e in entries:
+            e.pop("mtime", None)
+        return entries
+
+    def list_service_log_files(self, service_name: str) -> Dict[str, Any]:
+        """
+        List all available log files and action log categories for a registered service,
+        including file sizes and last-modified timestamps.
+        """
         svc: Optional[ServiceDefinition] = self.config.services.get(service_name)
         if not svc:
             return {
@@ -394,27 +458,222 @@ class OpsToolkit:
                 "error": f"Unknown service '{service_name}'. Registered services: {list(self.config.services.keys())}",
             }
 
-        collected: Dict[str, str] = {}
-        for pattern in svc.log_paths:
-            matched_files = sorted(
-                (Path(p) for p in glob.glob(pattern)),
-                key=lambda p: p.stat().st_mtime if p.exists() else 0,
-                reverse=True,
-            )
-            for file_path in matched_files[:2]:  # Latest 2 files per glob pattern
-                collected[str(file_path)] = _tail_file(file_path, lines=lines, filter_keyword=filter_keyword)
+        discovered = self._discover_service_log_paths(svc)
+        return {
+            "ok": True,
+            "service_name": service_name,
+            "configured_categories": svc.log_files,
+            "logs_dir": svc.logs_dir,
+            "total_files_found": len(discovered),
+            "files": discovered,
+        }
 
-        # Also include PM2 logs if managed by PM2 and no custom log files matched
-        if not collected and svc.manager == "pm2" and svc.pm2_name:
+    def get_service_logs(
+        self,
+        service_name: str,
+        lines: int = 100,
+        filter_keyword: str = "",
+        category_or_file: str = "",
+        max_files: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        Read recent log lines across a service's multiple action log files.
+        - `category_or_file`: Optional action log category key (e.g. 'payment', 'webhook', 'auth')
+          or filename substring (e.g. 'payment_2026.log'). If empty, reads across all active log files!
+        - `filter_keyword`: Optional substring filter (e.g. 'ERROR', 'Traceback', 'order_123').
+        """
+        svc: Optional[ServiceDefinition] = self.config.services.get(service_name)
+        if not svc:
+            return {
+                "ok": False,
+                "error": f"Unknown service '{service_name}'. Registered services: {list(self.config.services.keys())}",
+            }
+
+        discovered = self._discover_service_log_paths(svc)
+        target_filter = category_or_file.strip().lower()
+
+        if target_filter:
+            # First check if `category_or_file` matches a configured category or discovered filename
+            filtered_entries = [
+                e
+                for e in discovered
+                if target_filter in e["category"].lower()
+                or target_filter in e["filename"].lower()
+                or target_filter in e["path"].lower()
+            ]
+        else:
+            filtered_entries = discovered
+
+        collected: Dict[str, Dict[str, Any]] = {}
+        for entry in filtered_entries[: max(1, min(int(max_files), 25))]:
+            fpath = Path(entry["path"])
+            content = _tail_file(fpath, lines=lines, filter_keyword=filter_keyword)
+            if filter_keyword and not content:
+                continue
+            collected[entry["path"]] = {
+                "category": entry["category"],
+                "filename": entry["filename"],
+                "size_kb": entry["size_kb"],
+                "modified_utc": entry["modified_utc"],
+                "tail": content,
+            }
+
+        if not collected and not target_filter and svc.manager == "pm2" and svc.pm2_name:
             return self.get_pm2_logs(svc.pm2_name, lines=lines)
 
         return {
             "ok": True,
             "service_name": service_name,
-            "matched_files": len(collected),
+            "category_or_file_filter": category_or_file or "ALL",
+            "keyword_filter": filter_keyword or None,
+            "matched_files_count": len(collected),
+            "available_categories": list(svc.log_files.keys()),
             "logs": collected,
         }
 
+    # -------------------------------------------------------------------------
+    # 5. SERVICE SOURCE CODE INSPECTION (Search & Read Code Safely)
+    # -------------------------------------------------------------------------
+    def _resolve_jailed_service_path(self, svc: ServiceDefinition, relative_path: str = "") -> Path:
+        """Ensure any requested file path stays strictly inside the service's `working_dir`."""
+        if not svc.working_dir:
+            raise ValueError(f"Service '{svc.name}' does not have a `working_dir` configured.")
+        base = Path(svc.working_dir).resolve()
+        if not base.exists():
+            raise FileNotFoundError(f"Service working_dir does not exist on disk: {base}")
+        target = (base / relative_path).resolve() if relative_path else base
+        if base != target and base not in target.parents:
+            raise PermissionError(f"Path traversal outside service working_dir ({base}) is blocked.")
+        return target
+
+    def search_service_code(
+        self,
+        service_name: str,
+        query: str,
+        file_pattern: str = "*",
+        max_matches: int = 40,
+    ) -> Dict[str, Any]:
+        """
+        Search (`grep`) across a service's source code inside `working_dir` for a function,
+        error string, route, or variable name. Automatically skips `node_modules`, `.venv`, `.git`, etc.
+        """
+        svc = self.config.services.get(service_name)
+        if not svc:
+            return {
+                "ok": False,
+                "error": f"Unknown service '{service_name}'. Registered: {list(self.config.services.keys())}",
+            }
+        if not query or not query.strip():
+            return {"ok": False, "error": "Search query cannot be empty."}
+
+        try:
+            root = self._resolve_jailed_service_path(svc)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+        needle = query.strip().lower()
+        matches: List[Dict[str, Any]] = []
+        max_matches = max(1, min(int(max_matches), 100))
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            # Prune heavy or irrelevant directories in-place
+            dirnames[:] = [d for d in dirnames if d not in IGNORED_CODE_DIRS and not d.startswith(".git")]
+            for fname in filenames:
+                if file_pattern and file_pattern != "*" and not fnmatch.fnmatch(fname, file_pattern):
+                    continue
+                # Skip dotenv or binary files
+                if fname == ".env" or fname.endswith((".pyc", ".pyo", ".exe", ".dll", ".so", ".png", ".jpg", ".zip")):
+                    continue
+                fpath = Path(dirpath) / fname
+                try:
+                    if fpath.stat().st_size > 2 * 1024 * 1024:  # Skip files > 2MB
+                        continue
+                    with fpath.open("r", encoding="utf-8", errors="replace") as f:
+                        for idx, line in enumerate(f, start=1):
+                            if needle in line.lower():
+                                rel = str(fpath.relative_to(root))
+                                matches.append(
+                                    {
+                                        "file": rel,
+                                        "line": idx,
+                                        "content": redact_secrets(line.rstrip()[:240]),
+                                    }
+                                )
+                                if len(matches) >= max_matches:
+                                    return {
+                                        "ok": True,
+                                        "service_name": service_name,
+                                        "working_dir": str(root),
+                                        "query": query,
+                                        "truncated": True,
+                                        "matches": matches,
+                                    }
+                except Exception:
+                    continue
+
+        return {
+            "ok": True,
+            "service_name": service_name,
+            "working_dir": str(root),
+            "query": query,
+            "truncated": False,
+            "matches": matches,
+        }
+
+    def read_service_code_file(
+        self,
+        service_name: str,
+        relative_path: str,
+        start_line: int = 1,
+        end_line: int = 160,
+    ) -> Dict[str, Any]:
+        """
+        Read source code lines from a file inside a service's `working_dir` (with line numbers).
+        Blocks reading `.env` files or traversing outside `working_dir`.
+        """
+        svc = self.config.services.get(service_name)
+        if not svc:
+            return {
+                "ok": False,
+                "error": f"Unknown service '{service_name}'. Registered: {list(self.config.services.keys())}",
+            }
+
+        try:
+            target = self._resolve_jailed_service_path(svc, relative_path)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+        if target.name == ".env" or target.name.startswith(".env."):
+            return {"ok": False, "error": "Reading `.env` secret files is blocked by security policy."}
+
+        if not target.exists() or not target.is_file():
+            return {"ok": False, "error": f"Source file not found: {relative_path}"}
+
+        try:
+            with target.open("r", encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
+            total = len(all_lines)
+            s_idx = max(1, int(start_line))
+            e_idx = min(total, max(s_idx, min(int(end_line), s_idx + 250)))
+            numbered = [
+                f"{line_no:4d} | {redact_secrets(all_lines[line_no - 1].rstrip())}"
+                for line_no in range(s_idx, e_idx + 1)
+            ]
+            return {
+                "ok": True,
+                "service_name": service_name,
+                "file": relative_path,
+                "start_line": s_idx,
+                "end_line": e_idx,
+                "total_lines": total,
+                "content": "\n".join(numbered),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": f"Failed to read {relative_path}: {exc}"}
+
+    # -------------------------------------------------------------------------
+    # 6. WINDOWS SERVICES & EVENT VIEWER
+    # -------------------------------------------------------------------------
     def _check_single_windows_service(self, win_service_name: str) -> Dict[str, Any]:
         if not platform.system().lower().startswith("win"):
             return {"status": "unavailable_on_non_windows", "service_name": win_service_name}
@@ -446,11 +705,11 @@ class OpsToolkit:
             levels.append("2")
         if "warn" in level.lower():
             levels.append("3")
-        level_Clause = f"; Level=@({','.join(levels)})" if levels else ""
+        level_clause = f"; Level=@({','.join(levels)})" if levels else ""
         provider_clause = f"; ProviderName='*{source_filter}*'" if source_filter else ""
 
         ps_script = (
-            f"Get-WinEvent -FilterHashtable @{{LogName='{log_name}'{level_Clause}{provider_clause}}} "
+            f"Get-WinEvent -FilterHashtable @{{LogName='{log_name}'{level_clause}{provider_clause}}} "
             f"-MaxEvents {max_events} -ErrorAction SilentlyContinue | "
             f"Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message | ConvertTo-Json -Depth 3"
         )
@@ -467,7 +726,7 @@ class OpsToolkit:
             return {"ok": True, "log_name": log_name, "raw_output": res["stdout"][:3000]}
 
     # -------------------------------------------------------------------------
-    # 5. NGROK & N8N INSPECTORS
+    # 7. NGROK & N8N INSPECTORS
     # -------------------------------------------------------------------------
     def check_ngrok_status(self) -> Dict[str, Any]:
         """Inspect ngrok local API (`http://127.0.0.1:4040/api/tunnels` and `/api/requests/http`)."""
@@ -494,7 +753,6 @@ class OpsToolkit:
                 result["ok"] = True
                 result["active_tunnels"] = tunnels
 
-                # Also fetch recent captured HTTP requests to spot 500/502 errors
                 reqs_resp = client.get(f"{base}/api/requests/http?limit=15")
                 if reqs_resp.status_code == 200:
                     reqs_list = reqs_resp.json().get("requests", [])
@@ -506,7 +764,7 @@ class OpsToolkit:
                             {
                                 "id": r.get("id"),
                                 "start": r.get("start"),
-                                " method": req_info.get("method"),
+                                "method": req_info.get("method"),
                                 "uri": req_info.get("uri"),
                                 "status_code": resp_info.get("status_code"),
                                 "duration_ms": round((r.get("duration") or 0) / 1e6, 1)
@@ -543,13 +801,13 @@ class OpsToolkit:
                 key=lambda p: p.stat().st_mtime if p.exists() else 0,
                 reverse=True,
             )
-            for fpath in matched[:2]:
+            for fpath in matched[:3]:
                 logs_collected[str(fpath)] = _tail_file(fpath, lines=log_lines)
         out["logs"] = logs_collected
         return out
 
     # -------------------------------------------------------------------------
-    # 6. READ-ONLY MYSQL DATABASE INSPECTOR
+    # 8. READ-ONLY MYSQL DATABASE INSPECTOR
     # -------------------------------------------------------------------------
     def query_mysql_readonly(self, sql: str, database: str = "") -> Dict[str, Any]:
         """
@@ -594,7 +852,6 @@ class OpsToolkit:
                     cursor.execute("SET SESSION TRANSACTION READ ONLY;")
                     cursor.execute(safe_sql)
                     rows = cursor.fetchall()
-                    # Redact secrets and serialize safely
                     serialized_rows = json.loads(
                         redact_secrets(json.dumps(rows, default=str, ensure_ascii=False))
                     )
@@ -611,7 +868,7 @@ class OpsToolkit:
             return {"ok": False, "database": db_name, "executed_sql": safe_sql, "error": redact_secrets(str(exc))}
 
     # -------------------------------------------------------------------------
-    # 7. GATED ADMIN ACTIONS (Approval Queue + Execution on Admin Button Click)
+    # 9. GATED ADMIN ACTIONS (Approval Queue + Execution on Admin Button Click)
     # -------------------------------------------------------------------------
     def propose_action(
         self,
@@ -711,7 +968,7 @@ class OpsToolkit:
 
 
 # -----------------------------------------------------------------------------
-# CLI Entrypoint so `cli_subscription` mode (Cursor CLI / Claude CLI / Codex)
+# CLI Entrypoint so `cli_subscription` (Cursor/Claude/Codex) and `opencode`
 # can invoke the exact same toolkit via `python ops_toolkit.py <tool> ...`
 # -----------------------------------------------------------------------------
 def main(argv: Optional[List[str]] = None) -> int:
@@ -728,10 +985,42 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_pm2_logs.add_argument("--lines", type=int, default=100)
     p_pm2_logs.add_argument("--type", default="all", choices=["all", "error", "out"])
 
-    p_svc_logs = sub.add_parser("service-logs", help="Get recent log files for a registered service")
+    p_list_logs = sub.add_parser(
+        "list-service-logs",
+        help="List all log files and action log categories for a service (sizes & timestamps)",
+    )
+    p_list_logs.add_argument("--service", required=True, help="Service name in config.yaml")
+
+    p_svc_logs = sub.add_parser(
+        "service-logs",
+        help="Read recent log lines across one or all action log files for a service",
+    )
     p_svc_logs.add_argument("--service", required=True, help="Service name in config.yaml")
+    p_svc_logs.add_argument(
+        "--category",
+        default="",
+        help="Optional action category or filename substring (e.g. 'payment', 'webhook', 'auth'); empty reads all",
+    )
     p_svc_logs.add_argument("--lines", type=int, default=100)
     p_svc_logs.add_argument("--filter", default="", help="Optional substring filter (e.g. ERROR, Traceback)")
+    p_svc_logs.add_argument("--max-files", type=int, default=10)
+
+    p_search_code = sub.add_parser(
+        "search-code",
+        help="Search (grep) across a service's source code files inside its working_dir",
+    )
+    p_search_code.add_argument("--service", required=True, help="Service name in config.yaml")
+    p_search_code.add_argument("--query", required=True, help="Text or symbol to search for")
+    p_search_code.add_argument("--glob", default="*", help="Optional filename pattern (e.g. '*.py', '*.js')")
+
+    p_read_code = sub.add_parser(
+        "read-code",
+        help="Read source code lines from a file inside a service's working_dir",
+    )
+    p_read_code.add_argument("--service", required=True, help="Service name in config.yaml")
+    p_read_code.add_argument("--file", required=True, help="Relative path inside working_dir")
+    p_read_code.add_argument("--start-line", type=int, default=1)
+    p_read_code.add_argument("--end-line", type=int, default=160)
 
     p_win_ev = sub.add_parser("windows-events", help="Get recent Windows Event Viewer logs")
     p_win_ev.add_argument("--log-name", default="Application")
@@ -762,8 +1051,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         res = tk.get_pm2_status()
     elif args.command == "pm2-logs":
         res = tk.get_pm2_logs(args.app, lines=args.lines, log_type=args.type)
+    elif args.command == "list-service-logs":
+        res = tk.list_service_log_files(args.service)
     elif args.command == "service-logs":
-        res = tk.get_service_logs(args.service, lines=args.lines, filter_keyword=args.filter)
+        res = tk.get_service_logs(
+            args.service,
+            lines=args.lines,
+            filter_keyword=args.filter,
+            category_or_file=args.category,
+            max_files=args.max_files,
+        )
+    elif args.command == "search-code":
+        res = tk.search_service_code(args.service, query=args.query, file_pattern=args.glob)
+    elif args.command == "read-code":
+        res = tk.read_service_code_file(
+            args.service,
+            relative_path=args.file,
+            start_line=args.start_line,
+            end_line=args.end_line,
+        )
     elif args.command == "windows-events":
         res = tk.get_windows_event_logs(
             log_name=args.log_name, source_filter=args.source, max_events=args.max_events

@@ -6,7 +6,7 @@ import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Deque, Dict, List
+from typing import Any, Deque, Dict, List, Optional
 
 from agent.config import AppConfig
 
@@ -18,6 +18,10 @@ class AgentTurnResult:
     provider_used: str
     pending_actions: List[Dict[str, Any]] = field(default_factory=list)
     tool_calls_made: List[str] = field(default_factory=list)
+    native_session_id: Optional[str] = None
+    session_turn: int = 1
+    is_new_session: bool = True
+    session_rotation_reason: str = ""
 
 
 class ConversationMemory:
@@ -41,12 +45,14 @@ class ConversationMemory:
 
 
 def build_system_prompt(config: AppConfig, include_cli_instructions: bool = False) -> str:
-    """Build the server-aware system prompt describing all services, integrations, and safety rules."""
+    """Build the server-aware system prompt describing all services, multi-file logs, code paths, and safety rules."""
     svc_lines = []
     for name, svc in config.services.items():
+        cats = ", ".join(svc.log_files.keys()) if svc.log_files else "auto-discovered"
         svc_lines.append(
-            f"- `{name}` ({svc.runtime}, managed by {svc.manager}): {svc.description} | "
-            f"dir=`{svc.working_dir}` | health=`{svc.health_url or 'N/A'}` | port={svc.port or 'N/A'}"
+            f"- `{name}` ({svc.runtime}, managed by {svc.manager}): {svc.description}\n"
+            f"  • code_dir=`{svc.working_dir}` | logs_dir=`{svc.logs_dir or 'N/A'}` | "
+            f"action_log_categories=[{cats}] | health=`{svc.health_url or 'N/A'}` | port={svc.port or 'N/A'}"
         )
     services_block = "\n".join(svc_lines) if svc_lines else "- (No services registered in config.yaml)"
 
@@ -58,7 +64,7 @@ def build_system_prompt(config: AppConfig, include_cli_instructions: bool = Fals
     )
 
     prompt = f"""You are the Windows Server Operations & Debugging Agent for `{config.server_name}` (Timezone: `{config.timezone}`).
-You assist the engineering team via Telegram to inspect services, analyze logs, check PM2/ngrok/n8n health, query MySQL read-only, and pinpoint root causes.
+You assist the engineering team via Telegram to inspect services, analyze multi-file action logs, read & search service source code, check PM2/ngrok/n8n health, query MySQL read-only, and pinpoint root causes.
 
 ### Registered Services on This Windows Server
 {services_block}
@@ -70,31 +76,32 @@ You assist the engineering team via Telegram to inspect services, analyze logs, 
 - MySQL (Read-Only): {mysql_info}
 
 ### Mandatory Safety & Operating Rules
-1. READ-ONLY FIRST: Always gather evidence (service status, PM2 logs, application log files, Windows Event Viewer, ngrok requests, or read-only MySQL `SELECT`/`SHOW` queries) before jumping to conclusions.
-2. NEVER RUN DESTRUCTIVE COMMANDS DIRECTLY: Never run `pm2 restart`, `Restart-Service`, `taskkill`, `Stop-Process`, or SQL write statements (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`) directly.
-3. GATED ACTIONS VIA APPROVAL BUTTON: If a service restart, reload, or hung query kill is needed, use the `propose_action` tool (or `python ops_toolkit.py propose-action ...`). That queues an interactive `[Approve]` / `[Reject]` button in Telegram for an Admin to confirm.
-4. CONCISE TELEGRAM FORMATTING: Format findings clearly for mobile Telegram reading—state the root cause, cite relevant log lines/metrics, and state recommended next steps.
+1. READ-ONLY FIRST: Always gather evidence (service status, PM2 logs, action-specific log files, source code lines, Windows Event Viewer, ngrok requests, or read-only MySQL `SELECT`/`SHOW` queries) before jumping to conclusions.
+2. MULTIPLE ACTION LOG FILES: Services log different actions into different files (e.g. `payment`, `webhook`, `auth`, `scheduler`, `error`). List or filter by category/file when investigating specific actions, and cross-reference stack traces with the service's source code inside `code_dir`.
+3. NEVER RUN DESTRUCTIVE COMMANDS DIRECTLY: Never run `pm2 restart`, `Restart-Service`, `taskkill`, `Stop-Process`, or SQL write statements (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`) directly, and never modify production source code unless explicitly asked.
+4. GATED ACTIONS VIA APPROVAL BUTTON: If a service restart, reload, or hung query kill is needed, use the `propose_action` tool (or `python ops_toolkit.py propose-action ...`). That queues an interactive `[Approve]` / `[Reject]` button in Telegram for an Admin to confirm.
+5. CONCISE TELEGRAM FORMATTING: Format findings clearly for mobile Telegram reading—state the root cause, cite exact log files and source code file:line numbers, and state recommended next steps.
 """
 
     if include_cli_instructions:
         toolkit_path = Path("ops_toolkit.py").resolve()
         python_exe = sys.executable or "python"
         prompt += f"""
-### How to Run Server Diagnostic Tools in CLI Mode
-You have access to the shared Python toolkit at `{toolkit_path}` using `{python_exe}`.
-Run these commands to inspect the server safely:
+### How to Run Server Diagnostic, Multi-Log, & Code Tools in CLI Mode
+You have access to the shared Python toolkit at `{toolkit_path}` using `{python_exe}` (in addition to your native file read/grep tools):
 - System CPU/RAM/Disk/Processes: `{python_exe} "{toolkit_path}" --config "{config.config_path}" system-resources`
 - All Registered Services Health: `{python_exe} "{toolkit_path}" --config "{config.config_path}" services-status`
 - PM2 Process List (JSON): `{python_exe} "{toolkit_path}" --config "{config.config_path}" pm2-status`
 - PM2 App Logs: `{python_exe} "{toolkit_path}" --config "{config.config_path}" pm2-logs --app <pm2_name> --lines 100`
-- Service Log Files: `{python_exe} "{toolkit_path}" --config "{config.config_path}" service-logs --service <service_name> --lines 100 --filter "<keyword>"`
+- List All Action Log Files for a Service: `{python_exe} "{toolkit_path}" --config "{config.config_path}" list-service-logs --service <service_name>`
+- Read Service Action Logs (one category/file or all): `{python_exe} "{toolkit_path}" --config "{config.config_path}" service-logs --service <service_name> --category "<payment|webhook|all>" --lines 100 --filter "<keyword>"`
+- Search Service Source Code: `{python_exe} "{toolkit_path}" --config "{config.config_path}" search-code --service <service_name> --query "<symbol_or_error>"`
+- Read Service Source Code File: `{python_exe} "{toolkit_path}" --config "{config.config_path}" read-code --service <service_name> --file "<relative_path>" --start-line 1 --end-line 150`
 - Windows Event Viewer: `{python_exe} "{toolkit_path}" --config "{config.config_path}" windows-events --log-name Application --max-events 25`
 - ngrok Tunnels & Webhook Requests: `{python_exe} "{toolkit_path}" --config "{config.config_path}" ngrok-status`
 - n8n Health & Logs: `{python_exe} "{toolkit_path}" --config "{config.config_path}" n8n-status`
 - Read-Only MySQL Query: `{python_exe} "{toolkit_path}" --config "{config.config_path}" mysql-query --sql "SELECT ..." --database "{config.integrations.mysql.default_database}"`
 - Propose Gated Action (Creates Telegram Approval Button):
   `{python_exe} "{toolkit_path}" --config "{config.config_path}" propose-action --type <pm2_restart|pm2_reload|windows_service_restart|mysql_kill_query> --target <name_or_id> --reason "<why>"`
-
-You may also inspect source code and log files in the service `working_dir` directories using read-only file/grep operations.
 """
     return prompt

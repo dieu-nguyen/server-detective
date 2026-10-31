@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
 from dotenv import load_dotenv
+
+
+@dataclass
+class SessionConfig:
+    """Controls native CLI/SDK session continuation and automatic rotation in Telegram."""
+
+    enabled: bool = True
+    sessions_file: str = "./.sessions.json"
+    idle_timeout_minutes: int = 30  # Auto-start a fresh native session if chat was quiet > 30 mins
+    max_turns_per_session: int = 15  # Auto-rotate session after N turns to prevent context bloat
+    show_new_session_button: bool = True  # Show inline [🔄 New Session] button on replies
 
 
 @dataclass
@@ -31,12 +41,26 @@ class CLISubscriptionConfig:
 
 @dataclass
 class SDKApiKeyConfig:
+    """
+    Configuration for `sdk_apikey` mode.
+    Supports BOTH:
+      1. `harness: "opencode"` (Default — uses OpenCode CLI `opencode run` with your API key,
+         giving full native code reading/grep, native `--session <id>` continuation, and 75+ providers)
+      2. `harness: "pi"` (Uses `@mariozechner/pi-coding-agent` CLI `pi -p` with your API key)
+      3. `harness: "python_sdk"` (In-memory Python async loop via `anthropic` / `openai` SDK)
+    """
+
+    harness: str = "opencode"  # "opencode" | "pi" | "python_sdk"
+    opencode_bin: str = "opencode"
+    pi_bin: str = "pi"
     provider: str = "anthropic"  # "openai" | "anthropic" | "gemini" | "openrouter" | "custom_openai"
-    model: str = "claude-3-5-haiku-latest"
+    model: str = "claude-3-5-haiku-latest"  # For opencode, can also be "anthropic/claude-sonnet-4-5" or "openai/gpt-4.1-mini"
     api_key_env: str = "ANTHROPIC_API_KEY"
     base_url: str = ""
+    timeout_seconds: int = 180
     max_tool_turns: int = 8
     temperature: float = 0.1
+    auto_fallback_to_python_sdk: bool = True  # If opencode binary is not installed, fall back to in-memory Python SDK
 
 
 @dataclass
@@ -47,6 +71,7 @@ class EngineConfig:
     max_history_messages: int = 10
     audit_log_file: str = "./audit.jsonl"
     pending_actions_file: str = "./.pending_actions.json"
+    session: SessionConfig = field(default_factory=SessionConfig)
     cli_subscription: CLISubscriptionConfig = field(default_factory=CLISubscriptionConfig)
     sdk_apikey: SDKApiKeyConfig = field(default_factory=SDKApiKeyConfig)
 
@@ -117,7 +142,9 @@ class ServiceDefinition:
     win_service_name: str = ""
     process_match: str = ""
     working_dir: str = ""
-    log_paths: List[str] = field(default_factory=list)
+    logs_dir: str = ""  # Optional directory containing multiple action log files
+    log_files: Dict[str, str] = field(default_factory=dict)  # Action name -> path/glob (e.g. {"payment": ".../payment.log"})
+    log_paths: List[str] = field(default_factory=list)  # General list of paths/globs
     event_log_source: str = ""
     health_url: str = ""
     port: Optional[int] = None
@@ -162,8 +189,17 @@ def load_config(config_path: str | Path = "config.yaml", env_path: Optional[str 
         raw: Dict[str, Any] = yaml.safe_load(f) or {}
 
     eng_raw = raw.get("engine", {}) or {}
+    sess_raw = eng_raw.get("session", {}) or {}
     cli_raw = eng_raw.get("cli_subscription", {}) or {}
     sdk_raw = eng_raw.get("sdk_apikey", {}) or {}
+
+    session_cfg = SessionConfig(
+        enabled=bool(sess_raw.get("enabled", True)),
+        sessions_file=str(sess_raw.get("sessions_file", "./.sessions.json")),
+        idle_timeout_minutes=int(sess_raw.get("idle_timeout_minutes", 30)),
+        max_turns_per_session=int(sess_raw.get("max_turns_per_session", 15)),
+        show_new_session_button=bool(sess_raw.get("show_new_session_button", True)),
+    )
 
     default_binaries = {
         "cursor": "agent",
@@ -184,12 +220,17 @@ def load_config(config_path: str | Path = "config.yaml", env_path: Optional[str 
     )
 
     sdk_cfg = SDKApiKeyConfig(
+        harness=str(sdk_raw.get("harness", "opencode")).lower(),
+        opencode_bin=str(sdk_raw.get("opencode_bin", "opencode")),
+        pi_bin=str(sdk_raw.get("pi_bin", "pi")),
         provider=str(sdk_raw.get("provider", "anthropic")).lower(),
         model=str(sdk_raw.get("model", "claude-3-5-haiku-latest")),
         api_key_env=str(sdk_raw.get("api_key_env", "ANTHROPIC_API_KEY")),
         base_url=str(sdk_raw.get("base_url", "") or ""),
+        timeout_seconds=int(sdk_raw.get("timeout_seconds", 180)),
         max_tool_turns=int(sdk_raw.get("max_tool_turns", 8)),
         temperature=float(sdk_raw.get("temperature", 0.1)),
+        auto_fallback_to_python_sdk=bool(sdk_raw.get("auto_fallback_to_python_sdk", True)),
     )
 
     mode = str(eng_raw.get("mode", "cli_subscription")).lower()
@@ -203,6 +244,7 @@ def load_config(config_path: str | Path = "config.yaml", env_path: Optional[str 
         max_history_messages=int(eng_raw.get("max_history_messages", 10)),
         audit_log_file=str(eng_raw.get("audit_log_file", "./audit.jsonl")),
         pending_actions_file=str(eng_raw.get("pending_actions_file", "./.pending_actions.json")),
+        session=session_cfg,
         cli_subscription=cli_cfg,
         sdk_apikey=sdk_cfg,
     )
@@ -262,6 +304,8 @@ def load_config(config_path: str | Path = "config.yaml", env_path: Optional[str 
         if not isinstance(svc_data, dict):
             continue
         port_val = svc_data.get("port")
+        raw_log_files = svc_data.get("log_files") or {}
+        log_files_dict = {str(k): str(v) for k, v in raw_log_files.items()} if isinstance(raw_log_files, dict) else {}
         services[svc_name] = ServiceDefinition(
             name=svc_name,
             description=str(svc_data.get("description", "") or ""),
@@ -271,6 +315,8 @@ def load_config(config_path: str | Path = "config.yaml", env_path: Optional[str 
             win_service_name=str(svc_data.get("win_service_name", "") or ""),
             process_match=str(svc_data.get("process_match", "") or ""),
             working_dir=str(svc_data.get("working_dir", "") or ""),
+            logs_dir=str(svc_data.get("logs_dir", "") or ""),
+            log_files=log_files_dict,
             log_paths=list(svc_data.get("log_paths", []) or []),
             event_log_source=str(svc_data.get("event_log_source", "") or ""),
             health_url=str(svc_data.get("health_url", "") or ""),

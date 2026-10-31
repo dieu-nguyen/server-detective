@@ -7,5 +7,6 @@ venv/
 env/
 *.log
 .pending_actions.json
+.sessions.json
 audit.jsonl
 .pytest_cache/

@@ -1,9 +1,14 @@
 """
-Mode 2: SDK API Key Engine (`sdk_apikey`).
+Mode 2: SDK / API Key Engine (`sdk_apikey`).
 
-Runs an in-memory Python async tool-calling loop directly against an LLM HTTP API
-using an API key (`anthropic`, `openai`, `gemini`, `openrouter`, or `custom_openai`),
-calling `OpsToolkit` methods directly in-process.
+Supports two execution harnesses powered by your API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, etc.):
+1. **OpenCode CLI Harness (`harness: "opencode"`, default) or Pi CLI (`harness: "pi"`):**
+   - Runs `opencode run "<prompt>" --format json [--session <session_id>] [--model <provider/model>]`
+   - Gives API key mode full built-in coding agent capabilities (file read, ripgrep, glob, context compaction)
+     PLUS native `--session <id>` continuation and access to `ops_toolkit.py`.
+2. **In-Memory Python SDK Loop (`harness: "python_sdk"` or automatic fallback):**
+   - Calls `OpsToolkit` methods (including multi-file logs `list_service_log_files` / `get_service_logs`
+     and source code inspection `search_service_code` / `read_service_code_file`) directly in-memory.
 """
 
 from __future__ import annotations
@@ -11,14 +16,18 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
+import shutil
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.config import AppConfig
 from agent.engines.base import AgentTurnResult, build_system_prompt
 from agent.security import redact_secrets
+from agent.session_manager import parse_cli_json_output
 from ops_toolkit import OpsToolkit
 
-# Provider-agnostic tool schemas (converted automatically for Anthropic or OpenAI-compatible APIs)
+# Provider-agnostic tool schemas for the in-memory Python SDK loop
 TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "name": "get_system_resources",
@@ -27,7 +36,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
     {
         "name": "list_registered_services_status",
-        "description": "Check status, PM2/Windows Service state, port listener, and HTTP health check for all services in config.yaml.",
+        "description": "Check status, PM2/Windows Service state, log categories, port listener, and HTTP health check for all services in config.yaml.",
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
     {
@@ -53,19 +62,64 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         },
     },
     {
-        "name": "get_service_logs",
-        "description": "Read latest application log files for a registered service in config.yaml, with optional keyword filter.",
+        "name": "list_service_log_files",
+        "description": "List all available log files and action log categories (e.g. payment, webhook, auth, error) for a service, with sizes and timestamps.",
         "parameters": {
             "type": "object",
             "properties": {
                 "service_name": {"type": "string", "description": "Service key from config.yaml"},
-                "lines": {"type": "integer", "description": "Number of tail lines (default 100)", "default": 100},
+            },
+            "required": ["service_name"],
+        },
+    },
+    {
+        "name": "get_service_logs",
+        "description": "Read recent lines across a service's multiple action log files. Can filter by action category/filename and keyword.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "service_name": {"type": "string", "description": "Service key from config.yaml"},
+                "category_or_file": {
+                    "type": "string",
+                    "description": "Optional action log category (e.g. 'payment', 'webhook', 'auth') or filename substring. Leave empty to read across all log files.",
+                },
+                "lines": {"type": "integer", "description": "Number of tail lines per file (default 100)", "default": 100},
                 "filter_keyword": {
                     "type": "string",
                     "description": "Optional substring filter (e.g. 'ERROR', 'Traceback', '502')",
                 },
             },
             "required": ["service_name"],
+        },
+    },
+    {
+        "name": "search_service_code",
+        "description": "Search (grep) across a service's source code files inside its working_dir for an error message, function, class, or route.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "service_name": {"type": "string", "description": "Service key from config.yaml"},
+                "query": {"type": "string", "description": "Substring or symbol to search for in code"},
+                "file_pattern": {
+                    "type": "string",
+                    "description": "Optional filename glob filter (e.g. '*.py', '*.js', '*.ts')",
+                },
+            },
+            "required": ["service_name", "query"],
+        },
+    },
+    {
+        "name": "read_service_code_file",
+        "description": "Read source code lines with line numbers from a file inside a service's working_dir.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "service_name": {"type": "string", "description": "Service key from config.yaml"},
+                "relative_path": {"type": "string", "description": "Relative file path inside working_dir"},
+                "start_line": {"type": "integer", "description": "1-based start line (default 1)", "default": 1},
+                "end_line": {"type": "integer", "description": "1-based end line (default 160)", "default": 160},
+            },
+            "required": ["service_name", "relative_path"],
         },
     },
     {
@@ -130,7 +184,6 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
 ]
 
-# Default OpenAI-compatible base URLs for multi-provider flexibility
 OPENAI_COMPAT_BASE_URLS = {
     "openai": None,
     "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -139,11 +192,49 @@ OPENAI_COMPAT_BASE_URLS = {
 
 
 class SDKApiKeyEngine:
-    """In-memory Python tool-calling loop supporting Anthropic and OpenAI-compatible providers."""
+    """
+    API Key Engine supporting:
+    - `opencode` CLI harness (`opencode run --format json --session <id>`)
+    - `pi` CLI harness (`pi -p`)
+    - `python_sdk` in-memory async loop (direct or automatic fallback)
+    """
 
     def __init__(self, config: AppConfig, toolkit: OpsToolkit) -> None:
         self.config = config
         self.toolkit = toolkit
+
+    def build_opencode_command(
+        self,
+        prompt: str,
+        resume_session_id: Optional[str] = None,
+    ) -> List[str]:
+        """Build the `opencode run` argv with `--format json`, `--model provider/model`, and `--session <id>`."""
+        sdk_cfg = self.config.engine.sdk_apikey
+        bin_parts = shlex.split(sdk_cfg.opencode_bin or "opencode")
+        cmd = [*bin_parts, "run", prompt, "--format", "json"]
+        if resume_session_id:
+            cmd.extend(["--session", resume_session_id])
+        if sdk_cfg.model:
+            model_arg = sdk_cfg.model if "/" in sdk_cfg.model else f"{sdk_cfg.provider}/{sdk_cfg.model}"
+            cmd.extend(["--model", model_arg])
+        return cmd
+
+    def build_pi_command(
+        self,
+        prompt: str,
+        resume_session_id: Optional[str] = None,
+    ) -> List[str]:
+        """Build the `pi` coding agent CLI argv."""
+        sdk_cfg = self.config.engine.sdk_apikey
+        bin_parts = shlex.split(sdk_cfg.pi_bin or "pi")
+        cmd = [*bin_parts, "-p", prompt]
+        if resume_session_id:
+            cmd.extend(["--session", resume_session_id])
+        if sdk_cfg.provider:
+            cmd.extend(["--provider", sdk_cfg.provider])
+        if sdk_cfg.model:
+            cmd.extend(["--model", sdk_cfg.model])
+        return cmd
 
     def _execute_tool(
         self,
@@ -167,11 +258,27 @@ class SDKApiKeyEngine:
                     lines=int(args.get("lines", 100)),
                     log_type=str(args.get("log_type", "all")),
                 )
+            elif name == "list_service_log_files":
+                res = self.toolkit.list_service_log_files(service_name=str(args.get("service_name", "")))
             elif name == "get_service_logs":
                 res = self.toolkit.get_service_logs(
                     service_name=str(args.get("service_name", "")),
                     lines=int(args.get("lines", 100)),
                     filter_keyword=str(args.get("filter_keyword", "")),
+                    category_or_file=str(args.get("category_or_file", "")),
+                )
+            elif name == "search_service_code":
+                res = self.toolkit.search_service_code(
+                    service_name=str(args.get("service_name", "")),
+                    query=str(args.get("query", "")),
+                    file_pattern=str(args.get("file_pattern", "*")),
+                )
+            elif name == "read_service_code_file":
+                res = self.toolkit.read_service_code_file(
+                    service_name=str(args.get("service_name", "")),
+                    relative_path=str(args.get("relative_path", "")),
+                    start_line=int(args.get("start_line", 1)),
+                    end_line=int(args.get("end_line", 160)),
                 )
             elif name == "get_windows_event_logs":
                 res = self.toolkit.get_windows_event_logs(
@@ -209,18 +316,39 @@ class SDKApiKeyEngine:
         self,
         user_message: str,
         history: List[Dict[str, str]],
+        resume_session_id: Optional[str] = None,
         requester_user_id: Optional[int] = None,
         requester_username: str = "",
     ) -> AgentTurnResult:
         sdk_cfg = self.config.engine.sdk_apikey
         provider = sdk_cfg.provider.lower()
+        harness = sdk_cfg.harness.lower()
+
         api_key = os.environ.get(sdk_cfg.api_key_env, "").strip()
         if not api_key:
             raise RuntimeError(
                 f"Missing API key in environment variable `{sdk_cfg.api_key_env}` for `sdk_apikey` mode "
-                f"(provider=`{provider}`). Set `{sdk_cfg.api_key_env}` in `.env` or switch to `cli_subscription`."
+                f"(harness=`{harness}`, provider=`{provider}`). Set `{sdk_cfg.api_key_env}` in `.env` or switch to `cli_subscription`."
             )
 
+        if harness in ("opencode", "pi"):
+            bin_to_check = shlex.split(sdk_cfg.opencode_bin if harness == "opencode" else sdk_cfg.pi_bin)[0]
+            if shutil.which(bin_to_check):
+                return await self._run_cli_harness_turn(
+                    harness=harness,
+                    user_message=user_message,
+                    history=history,
+                    resume_session_id=resume_session_id,
+                    requester_user_id=requester_user_id,
+                    requester_username=requester_username,
+                )
+            if not sdk_cfg.auto_fallback_to_python_sdk:
+                raise RuntimeError(
+                    f"API Key harness `{harness}` binary (`{bin_to_check}`) was not found on PATH. "
+                    f"Install it (`npm i -g opencode-ai`) or set `auto_fallback_to_python_sdk: true` in `config.yaml`."
+                )
+
+        # In-memory Python SDK loop (either selected directly or via auto_fallback_to_python_sdk)
         if provider == "anthropic":
             return await self._run_anthropic_loop(
                 api_key=api_key,
@@ -235,6 +363,89 @@ class SDKApiKeyEngine:
             history=history,
             requester_user_id=requester_user_id,
             requester_username=requester_username,
+        )
+
+    async def _run_cli_harness_turn(
+        self,
+        harness: str,
+        user_message: str,
+        history: List[Dict[str, str]],
+        resume_session_id: Optional[str],
+        requester_user_id: Optional[int],
+        requester_username: str,
+    ) -> AgentTurnResult:
+        """Execute `opencode run` or `pi -p` with native session continuation and `ops_toolkit.py` access."""
+        sdk_cfg = self.config.engine.sdk_apikey
+
+        if resume_session_id:
+            composed_prompt = (
+                f"[Follow-up from @{requester_username or requester_user_id or 'teammate'}]:\n"
+                f"{user_message}"
+            )
+        else:
+            sys_prompt = build_system_prompt(self.config, include_cli_instructions=True)
+            history_lines = [
+                f"{'User' if m['role'] == 'user' else 'Agent'}: {m['content']}" for m in history[-6:]
+            ]
+            composed_prompt = (
+                f"{sys_prompt}\n\n"
+                f"--- Recent Conversation Context ---\n{chr(10).join(history_lines) or '(New session)'}\n\n"
+                f"--- Request from @{requester_username or requester_user_id or 'teammate'} ---\n"
+                f"{user_message}"
+            )
+
+        before_ids = {a["action_id"] for a in self.toolkit.action_store.list_pending()}
+        argv = (
+            self.build_opencode_command(composed_prompt, resume_session_id=resume_session_id)
+            if harness == "opencode"
+            else self.build_pi_command(composed_prompt, resume_session_id=resume_session_id)
+        )
+
+        cwd = self.config.engine.cli_subscription.default_working_dir
+        if not cwd or not Path(cwd).exists():
+            cwd = str(Path.cwd())
+
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+            env=os.environ.copy(),
+        )
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=sdk_cfg.timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"API Key harness (`{harness}`) timed out after {sdk_cfg.timeout_seconds}s.")
+
+        raw_stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
+        raw_stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+        if proc.returncode != 0 and not raw_stdout:
+            raise RuntimeError(
+                f"API Key harness (`{harness}`) exited with code {proc.returncode}: "
+                f"{redact_secrets(raw_stderr) or 'Unknown error'}"
+            )
+
+        parsed_text, extracted_session_id = parse_cli_json_output(raw_stdout)
+        answer = redact_secrets(parsed_text or raw_stderr or "Completed.")
+
+        after_actions = self.toolkit.action_store.list_pending()
+        new_actions = [a for a in after_actions if a["action_id"] not in before_ids]
+        for action in new_actions:
+            if not action.get("requested_by_user_id") and requester_user_id:
+                action["requested_by_user_id"] = requester_user_id
+                action["requested_by_username"] = requester_username
+
+        return AgentTurnResult(
+            answer=answer,
+            engine_used="sdk_apikey",
+            provider_used=f"{harness}:{sdk_cfg.provider}/{sdk_cfg.model}",
+            pending_actions=new_actions,
+            tool_calls_made=[f"harness:{harness}"],
+            native_session_id=extracted_session_id or resume_session_id,
         )
 
     async def _run_anthropic_loop(
@@ -285,7 +496,7 @@ class SDKApiKeyEngine:
                 return AgentTurnResult(
                     answer=final_text or "Completed.",
                     engine_used="sdk_apikey",
-                    provider_used=f"anthropic:{sdk_cfg.model}",
+                    provider_used=f"python_sdk:anthropic/{sdk_cfg.model}",
                     pending_actions=new_actions,
                     tool_calls_made=tools_called,
                 )
@@ -315,7 +526,7 @@ class SDKApiKeyEngine:
         return AgentTurnResult(
             answer="Reached maximum diagnostic tool turns. Please review the findings above or refine your question.",
             engine_used="sdk_apikey",
-            provider_used=f"anthropic:{sdk_cfg.model}",
+            provider_used=f"python_sdk:anthropic/{sdk_cfg.model}",
             pending_actions=new_actions,
             tool_calls_made=tools_called,
         )
@@ -371,7 +582,7 @@ class SDKApiKeyEngine:
                 return AgentTurnResult(
                     answer=final_text or "Completed.",
                     engine_used="sdk_apikey",
-                    provider_used=f"{provider}:{sdk_cfg.model}",
+                    provider_used=f"python_sdk:{provider}/{sdk_cfg.model}",
                     pending_actions=new_actions,
                     tool_calls_made=tools_called,
                 )
@@ -402,7 +613,7 @@ class SDKApiKeyEngine:
         return AgentTurnResult(
             answer="Reached maximum diagnostic tool turns. Please review the findings above or refine your question.",
             engine_used="sdk_apikey",
-            provider_used=f"{provider}:{sdk_cfg.model}",
+            provider_used=f"python_sdk:{provider}/{sdk_cfg.model}",
             pending_actions=new_actions,
             tool_calls_made=tools_called,
         )
