@@ -38,9 +38,11 @@ A unified, session-aware Python debugging agent for **Windows Server** that lets
 
 - **[System Architecture Document](docs/ARCHITECTURE.md)**
 - **Architecture Decision Records (ADRs):**
-  - **[ADR-001: Unifying Agent Architecture with Authentication Mode, OpenCode Harness, and Native Session Lifecycle](docs/adr/ADR-001-dual-engine-auth-architecture.md)**
+  - **[ADR-001: Unifying Agent Architecture with Authentication Mode, OpenCode Harness, and SQLite Cross-Tool Session Lifecycle](docs/adr/ADR-001-dual-engine-auth-architecture.md)**
   - **[ADR-002: Multi-Provider Abstraction with Cursor CLI as Default Subscription Engine](docs/adr/ADR-002-multi-provider-abstraction-cursor-default.md)**
   - **[ADR-003: Defense-in-Depth Team RBAC, Read-Only MySQL, and Gated Telegram Approvals](docs/adr/ADR-003-defense-in-depth-rbac-and-readonly-mysql.md)**
+  - **[ADR-004: SQLite Session Lifecycle, 30-Minute Post-Response Idle Timer, `/session <id>` Reuse, and Cross-Tool Session Porting](docs/adr/ADR-004-sqlite-session-lifecycle-and-cross-tool-porting.md)**
+  - **[ADR-005: Multi-File Action Log Discovery and Path-Jailed Source Code Inspection](docs/adr/ADR-005-multi-file-action-logs-and-jailed-code-inspection.md)**
 
 ---
 
