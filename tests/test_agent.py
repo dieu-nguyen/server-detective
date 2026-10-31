@@ -23,6 +23,7 @@ def test_config_loads_and_validates() -> None:
     assert cfg.engine.mode == "cli_subscription"
     assert cfg.engine.cli_subscription.provider == "cursor"
     assert cfg.engine.sdk_apikey.harness == "opencode"
+    assert cfg.engine.cli_restrictions.enabled is False
     assert cfg.engine.session.state_db_file == "./agent_state.db"
     assert cfg.engine.session.idle_timeout_minutes == 30
     assert cfg.engine.session.max_turns_per_session == 15
@@ -93,6 +94,22 @@ def test_cli_subscription_and_opencode_command_builders_with_sessions(tmp_path: 
     cmd_oc_resume = sdk_engine.build_opencode_command("follow up", resume_session_id="ses_xyz789")
     assert "--session" in cmd_oc_resume
     assert "ses_xyz789" in cmd_oc_resume
+
+    # 3. Verify optional hard CLI restrictions (disabled by default, enabled when flipped)
+    cfg.engine.cli_restrictions.enabled = True
+    oc_perms = sdk_engine.build_opencode_permissions_json()
+    assert oc_perms["permission"]["edit"] == "deny"
+    assert oc_perms["permission"]["bash"]["*"] == "deny"
+    assert oc_perms["permission"]["bash"]["python *ops_toolkit.py*"] == "allow"
+
+    cursor_perms = cli_engine.build_cursor_permissions_dict()
+    assert "Write(**)" in cursor_perms["permissions"]["deny"]
+    assert "Shell(python *ops_toolkit.py*)" in cursor_perms["permissions"]["allow"]
+
+    cfg.engine.cli_subscription.provider = "claude"
+    cmd_claude_restricted = cli_engine.build_command("check status")
+    assert "--disallowedTools" in cmd_claude_restricted
+    assert "--allowedTools" in cmd_claude_restricted
 
 
 def test_sqlite_session_lifecycle_cross_tool_porting_and_session_reuse(tmp_path: Path) -> None:

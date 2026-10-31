@@ -8,27 +8,26 @@ server_name: "prod-win-server-01"
 timezone: "Asia/Saigon"
 
 # ----------------------------------------------------------------------------
-# 1. AGENT ENGINE SWITCH & NATIVE SESSION MANAGEMENT
+# 1. AGENT ENGINE SWITCH, SESSION LIFECYCLE, & CLI RESTRICTIONS
 # ----------------------------------------------------------------------------
 # Choose between:
 #   - "cli_subscription": Uses your flat-rate monthly subscription via official
 #                         CLI agent (Cursor CLI default, or Claude / Codex / Gemini).
 #   - "sdk_apikey":       Uses an API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.)
-#                         powered by the OpenCode CLI harness (`opencode run --session`),
-#                         Pi CLI (`pi`), or the built-in Python SDK loop.
+#                         powered by the OpenCode CLI harness (`opencode run --session`)
+#                         or Pi CLI (`pi -p`).
 engine:
   mode: "cli_subscription"          # "cli_subscription" | "sdk_apikey"
   allow_telegram_mode_switch: true  # Allow admins to run `/mode cli_subscription` or `/mode sdk_apikey`
-  auto_fallback_to_sdk: false       # If true, falls back to sdk_apikey when CLI hits quota/timeout
-  max_history_messages: 10          # Fallback conversation turns kept per Telegram chat/topic
+  auto_fallback_to_sdk: false       # If true, falls back to sdk_apikey when CLI subscription hits quota/timeout
+  max_history_messages: 10          # Transcript turns kept for cross-tool session porting
   audit_log_file: "./audit.jsonl"
-  pending_actions_file: "./.pending_actions.json"
 
   # --- SQLite Session Lifecycle & Cross-Tool Porting (`agent_state.db`) ---
   # Stores all sessions, per-tool native IDs (`cursor`, `claude`, `opencode`, `pi`),
   # turn transcripts, pending approvals, and audit logs in a single SQLite DB (`agent_state.db`).
   # Automatically starts a fresh session when any of these conditions occur:
-  #   1. The chat has been idle for > `idle_timeout_minutes` (default 30 mins)
+  #   1. The chat has been idle for > `idle_timeout_minutes` (default 30 mins after last agent reply)
   #   2. The current session reaches `max_turns_per_session` (default 15 turns)
   #   3. A user types `/new` (or `/clear`) or clicks the [🔄 New Session] button
   # Reuse any old session anytime with `/session <session_id>` (resets turn count & idle timer!).
@@ -39,6 +38,36 @@ engine:
     max_turns_per_session: 15       # Auto-rotate after 15 back-and-forth turns
     show_new_session_button: true   # Attach [🔄 New Session] button to replies
 
+  # --- Optional Hard CLI Tool & Command Restrictions (Disabled by Default) ---
+  # When `enabled: false` (default), CLI agents rely on the system prompt safety rules.
+  # When you set `enabled: true`, the bot enforces hard CLI-level flags/permissions
+  # across Cursor CLI, Claude CLI, OpenCode, Pi, and Codex to block file edits and
+  # restrict shell commands strictly to `allowed_shell_commands`.
+  cli_restrictions:
+    enabled: false                  # <-- Set to true when you are ready to enforce hard CLI restrictions
+    allow_file_edits: false         # When restrictions are enabled, block Edit/Write tools
+    allowed_shell_commands:
+      - "python *ops_toolkit.py*"
+      - "python3 *ops_toolkit.py*"
+      - "*ops_toolkit.py*"
+      - "pm2 jlist*"
+      - "pm2 status*"
+      - "pm2 logs*"
+      - "pm2 describe*"
+    denied_shell_commands:
+      - "pm2 restart*"
+      - "pm2 reload*"
+      - "pm2 stop*"
+      - "pm2 delete*"
+      - "pm2 kill*"
+      - "*Restart-Service*"
+      - "*Stop-Service*"
+      - "*Stop-Process*"
+      - "taskkill*"
+      - "del *"
+      - "rm -rf*"
+      - "format *"
+
   # --- Mode A: CLI Subscription Configuration ---
   cli_subscription:
     # Built-in provider presets: "cursor" | "claude" | "codex" | "gemini" | "custom"
@@ -48,7 +77,6 @@ engine:
     model: ""
     timeout_seconds: 180
     max_concurrent_processes: 1     # Protects Windows Server from spawning multiple heavy CLI processes at once
-    # Working directory where CLI runs by default (can also access all service dirs below)
     default_working_dir: "C:\\Services"
     binaries:
       cursor: "agent"               # Cursor CLI binary (`agent` or `cursor-agent` or `wsl agent`)
@@ -57,25 +85,19 @@ engine:
       gemini: "gemini"              # Google Gemini CLI (`gemini`)
     custom_command_template: []
 
-  # --- Mode B: SDK / API Key Configuration (OpenCode Harness + Python SDK Fallback) ---
+  # --- Mode B: SDK / API Key Configuration (OpenCode / Pi CLI Harness) ---
   sdk_apikey:
     # Harness choice for API Key mode:
-    #   - "opencode":   Uses OpenCode CLI (`opencode run --format json --session <id>`)
-    #                   with your API key — gives full built-in code reading, grep,
-    #                   and native session continuation.
-    #   - "pi":         Uses Pi coding agent (`pi -p`) with your API key.
-    #   - "python_sdk": Uses the built-in in-memory Python async tool-calling loop.
-    harness: "opencode"             # "opencode" | "pi" | "python_sdk"
+    #   - "opencode": Uses OpenCode CLI (`opencode run --format json --session <id>`)
+    #   - "pi":       Uses Pi coding agent (`pi -p --session <id>`)
+    harness: "opencode"             # "opencode" | "pi"
     opencode_bin: "opencode"
     pi_bin: "pi"
-    provider: "anthropic"           # "openai" | "anthropic" | "gemini" | "openrouter" | "custom_openai"
+    provider: "anthropic"           # "openai" | "anthropic" | "gemini" | "openrouter" | etc.
     model: "claude-3-5-haiku-latest"
     api_key_env: "ANTHROPIC_API_KEY"
-    base_url: ""
     timeout_seconds: 180
-    max_tool_turns: 8
-    temperature: 0.1
-    auto_fallback_to_python_sdk: true  # Automatically uses in-memory Python SDK if `opencode` is not installed yet
+    max_concurrent_processes: 2
 
 # ----------------------------------------------------------------------------
 # 2. TELEGRAM & TEAM RBAC (Role-Based Access Control)
@@ -141,11 +163,6 @@ integrations:
 # ----------------------------------------------------------------------------
 # 4. MULTI-SERVICE REGISTRY (Multiple Action Logs + Source Code Directories)
 # ----------------------------------------------------------------------------
-# Each service can define:
-#   - `working_dir`: Where the service's source code lives (for code search & reading)
-#   - `logs_dir`:    Directory containing multiple action-specific log files
-#   - `log_files`:   Named action log map (e.g. auth, payment, webhook, error)
-#   - `log_paths`:   Additional log file globs (such as PM2 out/error logs)
 services:
   order-api-py:
     description: "Main Python FastAPI backend handling customer orders, payments, and webhooks"

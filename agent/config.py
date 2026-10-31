@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 @dataclass
 class SessionConfig:
-    """Controls SQLite-backed native CLI/SDK session continuation, cross-tool porting, and auto-rotation."""
+    """Controls SQLite-backed native CLI session continuation, cross-tool porting, and auto-rotation."""
 
     enabled: bool = True
     state_db_file: str = "./agent_state.db"
@@ -20,6 +20,44 @@ class SessionConfig:
     idle_timeout_minutes: int = 30  # Auto-start a fresh native session if chat was quiet > 30 mins
     max_turns_per_session: int = 15  # Auto-rotate session after N turns to prevent context bloat
     show_new_session_button: bool = True  # Show inline [🔄 New Session] button on replies
+
+
+@dataclass
+class CLIRestrictionsConfig:
+    """
+    Optional hard CLI tool/command restrictions for both `cli_subscription` and `sdk_apikey` (OpenCode/Pi).
+    Disabled (`enabled: false`) by default so you can review and enable it when ready.
+    """
+
+    enabled: bool = False
+    allow_file_edits: bool = False
+    allowed_shell_commands: List[str] = field(
+        default_factory=lambda: [
+            "python *ops_toolkit.py*",
+            "python3 *ops_toolkit.py*",
+            "*ops_toolkit.py*",
+            "pm2 jlist*",
+            "pm2 status*",
+            "pm2 logs*",
+            "pm2 describe*",
+        ]
+    )
+    denied_shell_commands: List[str] = field(
+        default_factory=lambda: [
+            "pm2 restart*",
+            "pm2 reload*",
+            "pm2 stop*",
+            "pm2 delete*",
+            "pm2 kill*",
+            "*Restart-Service*",
+            "*Stop-Service*",
+            "*Stop-Process*",
+            "taskkill*",
+            "del *",
+            "rm -rf*",
+            "format *",
+        ]
+    )
 
 
 @dataclass
@@ -43,25 +81,19 @@ class CLISubscriptionConfig:
 @dataclass
 class SDKApiKeyConfig:
     """
-    Configuration for `sdk_apikey` mode.
-    Supports BOTH:
-      1. `harness: "opencode"` (Default — uses OpenCode CLI `opencode run` with your API key,
-         giving full native code reading/grep, native `--session <id>` continuation, and 75+ providers)
-      2. `harness: "pi"` (Uses `@mariozechner/pi-coding-agent` CLI `pi -p` with your API key)
-      3. `harness: "python_sdk"` (In-memory Python async loop via `anthropic` / `openai` SDK)
+    Configuration for `sdk_apikey` mode (API Key mode).
+    Uses a CLI coding agent harness (`opencode` default, or `pi`) powered by your API key
+    (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`).
     """
 
-    harness: str = "opencode"  # "opencode" | "pi" | "python_sdk"
+    harness: str = "opencode"  # "opencode" | "pi"
     opencode_bin: str = "opencode"
     pi_bin: str = "pi"
-    provider: str = "anthropic"  # "openai" | "anthropic" | "gemini" | "openrouter" | "custom_openai"
-    model: str = "claude-3-5-haiku-latest"  # For opencode, can also be "anthropic/claude-sonnet-4-5" or "openai/gpt-4.1-mini"
+    provider: str = "anthropic"  # "openai" | "anthropic" | "gemini" | "openrouter" | etc.
+    model: str = "claude-3-5-haiku-latest"  # e.g. "claude-sonnet-4-5", "gpt-4.1-mini", "gemini-2.5-flash"
     api_key_env: str = "ANTHROPIC_API_KEY"
-    base_url: str = ""
     timeout_seconds: int = 180
-    max_tool_turns: int = 8
-    temperature: float = 0.1
-    auto_fallback_to_python_sdk: bool = True  # If opencode binary is not installed, fall back to in-memory Python SDK
+    max_concurrent_processes: int = 2
 
 
 @dataclass
@@ -71,8 +103,9 @@ class EngineConfig:
     auto_fallback_to_sdk: bool = False
     max_history_messages: int = 10
     audit_log_file: str = "./audit.jsonl"
-    pending_actions_file: str = "./.pending_actions.json"
+    pending_actions_file: str = "./agent_state.db"
     session: SessionConfig = field(default_factory=SessionConfig)
+    cli_restrictions: CLIRestrictionsConfig = field(default_factory=CLIRestrictionsConfig)
     cli_subscription: CLISubscriptionConfig = field(default_factory=CLISubscriptionConfig)
     sdk_apikey: SDKApiKeyConfig = field(default_factory=SDKApiKeyConfig)
 
@@ -143,9 +176,9 @@ class ServiceDefinition:
     win_service_name: str = ""
     process_match: str = ""
     working_dir: str = ""
-    logs_dir: str = ""  # Optional directory containing multiple action log files
-    log_files: Dict[str, str] = field(default_factory=dict)  # Action name -> path/glob (e.g. {"payment": ".../payment.log"})
-    log_paths: List[str] = field(default_factory=list)  # General list of paths/globs
+    logs_dir: str = ""  # Directory containing multiple action log files
+    log_files: Dict[str, str] = field(default_factory=dict)  # Action name -> path/glob
+    log_paths: List[str] = field(default_factory=list)
     event_log_source: str = ""
     health_url: str = ""
     port: Optional[int] = None
@@ -191,6 +224,7 @@ def load_config(config_path: str | Path = "config.yaml", env_path: Optional[str 
 
     eng_raw = raw.get("engine", {}) or {}
     sess_raw = eng_raw.get("session", {}) or {}
+    rest_raw = eng_raw.get("cli_restrictions", {}) or {}
     cli_raw = eng_raw.get("cli_subscription", {}) or {}
     sdk_raw = eng_raw.get("sdk_apikey", {}) or {}
 
@@ -207,6 +241,15 @@ def load_config(config_path: str | Path = "config.yaml", env_path: Optional[str 
         idle_timeout_minutes=int(sess_raw.get("idle_timeout_minutes", 30)),
         max_turns_per_session=int(sess_raw.get("max_turns_per_session", 15)),
         show_new_session_button=bool(sess_raw.get("show_new_session_button", True)),
+    )
+
+    default_allowed_cmds = CLIRestrictionsConfig().allowed_shell_commands
+    default_denied_cmds = CLIRestrictionsConfig().denied_shell_commands
+    restrictions_cfg = CLIRestrictionsConfig(
+        enabled=bool(rest_raw.get("enabled", False)),
+        allow_file_edits=bool(rest_raw.get("allow_file_edits", False)),
+        allowed_shell_commands=list(rest_raw.get("allowed_shell_commands", default_allowed_cmds) or []),
+        denied_shell_commands=list(rest_raw.get("denied_shell_commands", default_denied_cmds) or []),
     )
 
     default_binaries = {
@@ -234,11 +277,8 @@ def load_config(config_path: str | Path = "config.yaml", env_path: Optional[str 
         provider=str(sdk_raw.get("provider", "anthropic")).lower(),
         model=str(sdk_raw.get("model", "claude-3-5-haiku-latest")),
         api_key_env=str(sdk_raw.get("api_key_env", "ANTHROPIC_API_KEY")),
-        base_url=str(sdk_raw.get("base_url", "") or ""),
         timeout_seconds=int(sdk_raw.get("timeout_seconds", 180)),
-        max_tool_turns=int(sdk_raw.get("max_tool_turns", 8)),
-        temperature=float(sdk_raw.get("temperature", 0.1)),
-        auto_fallback_to_python_sdk=bool(sdk_raw.get("auto_fallback_to_python_sdk", True)),
+        max_concurrent_processes=int(sdk_raw.get("max_concurrent_processes", 2)),
     )
 
     mode = str(eng_raw.get("mode", "cli_subscription")).lower()
@@ -251,8 +291,9 @@ def load_config(config_path: str | Path = "config.yaml", env_path: Optional[str 
         auto_fallback_to_sdk=bool(eng_raw.get("auto_fallback_to_sdk", False)),
         max_history_messages=int(eng_raw.get("max_history_messages", 10)),
         audit_log_file=str(eng_raw.get("audit_log_file", "./audit.jsonl")),
-        pending_actions_file=str(eng_raw.get("pending_actions_file", "./.pending_actions.json")),
+        pending_actions_file=str(eng_raw.get("pending_actions_file", db_file)),
         session=session_cfg,
+        cli_restrictions=restrictions_cfg,
         cli_subscription=cli_cfg,
         sdk_apikey=sdk_cfg,
     )

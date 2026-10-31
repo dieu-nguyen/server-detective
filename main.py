@@ -30,6 +30,7 @@ def run_preflight_check(config_path: str) -> int:
         "cli_subscription_provider": cfg.engine.cli_subscription.provider,
         "sdk_apikey_harness": cfg.engine.sdk_apikey.harness,
         "sdk_apikey_provider": f"{cfg.engine.sdk_apikey.provider}:{cfg.engine.sdk_apikey.model}",
+        "cli_restrictions_enabled": cfg.engine.cli_restrictions.enabled,
         "session_lifecycle": {
             "enabled": cfg.engine.session.enabled,
             "state_db_file": cfg.engine.session.state_db_file,

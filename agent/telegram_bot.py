@@ -151,6 +151,7 @@ class TelegramOpsBot:
             f"• **Active Engine Mode:** `{mode}`\n"
             f"• **CLI Subscription Provider:** `{sub_provider}`\n"
             f"• **SDK API Key Harness:** `{sdk_provider}`\n"
+            f"• **Hard CLI Restrictions:** `{'enabled' if self.config.engine.cli_restrictions.enabled else 'disabled (prompt-only)'}`\n"
             f"• **Session Store:** SQLite (`{sess_cfg.state_db_file}`)\n"
             f"• **Session Auto-Rotation:** Idle > `{sess_cfg.idle_timeout_minutes}m` or > `{sess_cfg.max_turns_per_session}` turns\n"
             f"• **Registered Services:** `{', '.join(self.config.services.keys()) or 'None'}`\n\n"

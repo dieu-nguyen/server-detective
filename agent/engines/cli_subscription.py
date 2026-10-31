@@ -2,21 +2,19 @@
 Mode 1: CLI Subscription Engine (`cli_subscription`).
 
 Uses your existing monthly subscription (Cursor default, or Claude Code / OpenAI Codex / Gemini CLI).
-Session-aware:
-- When starting a new session (`native_session_id` is None), passes the full server system prompt +
-  user question and uses `--output-format json` to capture the CLI's native `session_id` (`chatId`).
-- On subsequent messages within the active session window, passes `--resume <native_session_id>`
-  so the CLI agent continues its exact native agent loop and file/tool context!
+Session-aware (`--resume <id>`) and supports optional hard CLI tool/command restrictions
+(`engine.cli_restrictions.enabled: true` in `config.yaml`, disabled by default).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from agent.config import AppConfig
 from agent.engines.base import AgentTurnResult, build_system_prompt
@@ -35,13 +33,33 @@ class CLISubscriptionEngine:
             max(1, config.engine.cli_subscription.max_concurrent_processes)
         )
 
+    def build_cursor_permissions_dict(self) -> Dict[str, Any]:
+        """
+        Build `.cursor/cli.json` permissions payload when `cli_restrictions.enabled` is True.
+        """
+        rest = self.config.engine.cli_restrictions
+        allow_list = ["Read(**)"]
+        if rest.allow_file_edits:
+            allow_list.append("Write(**)")
+        for pattern in rest.allowed_shell_commands:
+            allow_list.append(f"Shell({pattern})")
+
+        deny_list = []
+        if not rest.allow_file_edits:
+            deny_list.append("Write(**)")
+        for pattern in rest.denied_shell_commands:
+            deny_list.append(f"Shell({pattern})")
+
+        return {"permissions": {"allow": allow_list, "deny": deny_list}}
+
     def build_command(
         self,
         prompt: str,
         resume_session_id: Optional[str] = None,
     ) -> List[str]:
-        """Build the exact argv list for the configured CLI subscription provider, including `--resume` when continuing."""
+        """Build the exact argv list for the configured CLI subscription provider, including `--resume` and optional restrictions."""
         cli_cfg = self.config.engine.cli_subscription
+        rest_cfg = self.config.engine.cli_restrictions
         provider = cli_cfg.provider.lower()
         model = cli_cfg.model.strip()
 
@@ -55,8 +73,6 @@ class CLISubscriptionEngine:
         bin_parts = shlex.split(raw_bin)
 
         if provider == "cursor":
-            # Cursor CLI (`agent` or `cursor-agent`):
-            # Supports `-p` / `--print`, `--output-format json` (returns `session_id`), and `--resume <id>`
             binary_name = bin_parts[0]
             if len(bin_parts) == 1 and not shutil.which(binary_name):
                 for alt in ("cursor-agent", "agent"):
@@ -71,23 +87,29 @@ class CLISubscriptionEngine:
             return cmd
 
         if provider == "claude":
-            # Claude Code CLI (`claude -p "<prompt>" --output-format json [--resume <session_id>]`)
             cmd = [*bin_parts, "-p", prompt, "--output-format", "json"]
             if resume_session_id:
                 cmd.extend(["--resume", resume_session_id])
             if model:
                 cmd.extend(["--model", model])
+            if rest_cfg.enabled:
+                if not rest_cfg.allow_file_edits:
+                    cmd.extend(["--disallowedTools", "Edit", "Write", "NotebookEdit"])
+                allowed_tools = ["Read", "Grep", "Glob"]
+                for pat in rest_cfg.allowed_shell_commands:
+                    allowed_tools.append(f"Bash({pat})")
+                cmd.extend(["--allowedTools", *allowed_tools])
             return cmd
 
         if provider == "codex":
-            # OpenAI Codex CLI (`codex exec "<prompt>"`)
             cmd = [*bin_parts, "exec", prompt]
+            if rest_cfg.enabled and not rest_cfg.allow_file_edits:
+                cmd.extend(["--sandbox", "read-only"])
             if model:
                 cmd.extend(["--model", model])
             return cmd
 
         if provider == "gemini":
-            # Google Gemini CLI (`gemini -p "<prompt>"`)
             cmd = [*bin_parts, "-p", prompt]
             if model:
                 cmd.extend(["--model", model])
@@ -96,6 +118,22 @@ class CLISubscriptionEngine:
         raise ValueError(
             f"Unsupported cli_subscription.provider '{provider}'. Choose from: cursor, claude, codex, gemini, custom."
         )
+
+    def _prepare_cursor_cli_restrictions(self, cwd: str) -> None:
+        """If `cli_restrictions.enabled` is True and provider is `cursor`, write `.cursor/cli.json` in `cwd`."""
+        rest_cfg = self.config.engine.cli_restrictions
+        if not rest_cfg.enabled or self.config.engine.cli_subscription.provider.lower() != "cursor":
+            return
+        try:
+            cursor_dir = Path(cwd) / ".cursor"
+            cursor_dir.mkdir(parents=True, exist_ok=True)
+            cli_json_path = cursor_dir / "cli.json"
+            cli_json_path.write_text(
+                json.dumps(self.build_cursor_permissions_dict(), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     async def run_turn(
         self,
@@ -107,8 +145,6 @@ class CLISubscriptionEngine:
     ) -> AgentTurnResult:
         cli_cfg = self.config.engine.cli_subscription
 
-        # When resuming an existing native CLI session (`resume_session_id` is set),
-        # the CLI already holds the full system prompt and prior tool/file history natively!
         if resume_session_id:
             composed_prompt = (
                 f"[Follow-up from @{requester_username or requester_user_id or 'teammate'}]:\n"
@@ -135,6 +171,8 @@ class CLISubscriptionEngine:
         cwd = cli_cfg.default_working_dir
         if not cwd or not Path(cwd).exists():
             cwd = str(Path.cwd())
+
+        self._prepare_cursor_cli_restrictions(cwd)
 
         async with self._semaphore:
             try:

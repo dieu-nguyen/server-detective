@@ -43,6 +43,7 @@ A unified, session-aware Python debugging agent for **Windows Server** that lets
   - **[ADR-003: Defense-in-Depth Team RBAC, Read-Only MySQL, and Gated Telegram Approvals](docs/adr/ADR-003-defense-in-depth-rbac-and-readonly-mysql.md)**
   - **[ADR-004: SQLite Session Lifecycle, 30-Minute Post-Response Idle Timer, `/session <id>` Reuse, and Cross-Tool Session Porting](docs/adr/ADR-004-sqlite-session-lifecycle-and-cross-tool-porting.md)**
   - **[ADR-005: Multi-File Action Log Discovery and Path-Jailed Source Code Inspection](docs/adr/ADR-005-multi-file-action-logs-and-jailed-code-inspection.md)**
+  - **[ADR-006: Removing In-Memory Python SDK Loop in Favor of CLI Harnesses (`opencode` / `pi`) and Configurable Hard CLI Restrictions](docs/adr/ADR-006-cli-harnesses-only-and-configurable-restrictions.md)**
 
 ---
 
@@ -81,7 +82,9 @@ FLUSH PRIVILEGES;
      npm install -g opencode-ai
      ```
    - Set your API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, or `OPENROUTER_API_KEY`) in `.env`.
-   - *(Note: Even if `opencode` is not installed yet, `auto_fallback_to_python_sdk: true` in `config.yaml` lets `sdk_apikey` mode work immediately using the built-in Python SDK loop!)*
+3. **Optional Hard CLI Tool/Command Restrictions (`engine.cli_restrictions` in `config.yaml`):**
+   - Disabled by default (`enabled: false`) so you can review behavior first.
+   - When you flip `cli_restrictions.enabled: true` in `config.yaml`, the bot automatically enforces CLI-level read-only file access and restricts shell execution to `allowed_shell_commands` across Cursor CLI, Claude CLI, OpenCode, Pi, and Codex.
 
 ---
 
