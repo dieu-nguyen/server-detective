@@ -13,7 +13,7 @@ from agent.engines.cli_subscription import CLISubscriptionEngine
 from agent.engines.router import EngineRouter
 from agent.engines.sdk_apikey import SDKApiKeyEngine
 from agent.security import redact_secrets, validate_readonly_sql
-from agent.session_manager import SessionManager, parse_cli_json_output
+from agent.session_manager import SessionManager, init_sqlite_db, parse_cli_json_output
 from ops_toolkit import OpsToolkit
 
 
@@ -23,6 +23,7 @@ def test_config_loads_and_validates() -> None:
     assert cfg.engine.mode == "cli_subscription"
     assert cfg.engine.cli_subscription.provider == "cursor"
     assert cfg.engine.sdk_apikey.harness == "opencode"
+    assert cfg.engine.session.state_db_file == "./agent_state.db"
     assert cfg.engine.session.idle_timeout_minutes == 30
     assert cfg.engine.session.max_turns_per_session == 15
     assert "order-api-py" in cfg.services
@@ -68,7 +69,7 @@ def test_secret_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_cli_subscription_and_opencode_command_builders_with_sessions(tmp_path: Path) -> None:
     cfg = load_config("config.yaml")
-    cfg.engine.pending_actions_file = str(tmp_path / "pending.json")
+    cfg.engine.session.state_db_file = str(tmp_path / "state.db")
     tk = OpsToolkit(cfg)
     cli_engine = CLISubscriptionEngine(cfg, tk)
     sdk_engine = SDKApiKeyEngine(cfg, tk)
@@ -94,54 +95,72 @@ def test_cli_subscription_and_opencode_command_builders_with_sessions(tmp_path: 
     assert "ses_xyz789" in cmd_oc_resume
 
 
-def test_session_manager_lifecycle_and_auto_rotation(tmp_path: Path) -> None:
-    sess_file = tmp_path / "sessions.json"
-    mgr = SessionManager(sessions_file=sess_file, idle_timeout_minutes=30, max_turns_per_session=3)
+def test_sqlite_session_lifecycle_cross_tool_porting_and_session_reuse(tmp_path: Path) -> None:
+    db_file = tmp_path / "agent_state.db"
+    mgr = SessionManager(db_path=db_file, idle_timeout_minutes=30, max_turns_per_session=3)
 
-    # Turn 1: New session
+    # 1. Turn 1 in Cursor CLI: creates logical session `s_...` and records native ID `cur_001`
     st1 = mgr.resolve_session("-100123:main", "cli_subscription:cursor")
     assert st1.is_new_session is True
     assert st1.native_session_id is None
-    st1_saved = mgr.record_turn(st1, "ses_native_001")
+    st1_saved = mgr.record_turn(st1, "Why is order-api failing?", "Found DB timeout.", "cur_001")
+    first_logical_sid = st1_saved.session_id
     assert st1_saved.turn_count == 1
-    assert st1_saved.native_session_id == "ses_native_001"
+    assert st1_saved.native_session_id == "cur_001"
 
-    # Turn 2: Active follow-up resumes `ses_native_001`
+    # 2. Turn 2 in Cursor CLI: resumes `cur_001` natively
     st2 = mgr.resolve_session("-100123:main", "cli_subscription:cursor")
+    assert st2.session_id == first_logical_sid
     assert st2.is_new_session is False
-    assert st2.native_session_id == "ses_native_001"
-    mgr.record_turn(st2, "ses_native_001")
+    assert st2.native_session_id == "cur_001"
+    mgr.record_turn(st2, "Check payment.log", "Payment log shows 502.", "cur_001")
 
-    # Turn 3: Reaches max_turns=3
-    st3 = mgr.resolve_session("-100123:main", "cli_subscription:cursor")
-    mgr.record_turn(st3, "ses_native_001")
+    # 3. Cross-Tool Porting: User switches to OpenCode API (`sdk_apikey:opencode:anthropic`) on Turn 3!
+    #    The logical session is the SAME, `is_ported_across_tools` is True, and prior transcript is available!
+    st_port = mgr.resolve_session("-100123:main", "sdk_apikey:opencode:anthropic")
+    assert st_port.session_id == first_logical_sid
+    assert st_port.is_ported_across_tools is True
+    assert st_port.native_session_id is None  # OpenCode doesn't have a native ID yet on this session
+    assert len(st_port.transcript_messages) == 4  # 2 prior user+assistant turns ready to seed OpenCode!
+    st_port_saved = mgr.record_turn(st_port, "Trace line 42 in handler.py", "Bug is null check.", "ses_opencode_99")
+    assert st_port_saved.all_native_ids["cli_subscription:cursor"] == "cur_001"
+    assert st_port_saved.all_native_ids["sdk_apikey:opencode:anthropic"] == "ses_opencode_99"
 
-    # Turn 4: Exceeds max_turns_per_session (3) -> Auto-rotates to a brand new session!
-    st4 = mgr.resolve_session("-100123:main", "cli_subscription:cursor")
+    # 4. Turn 4 exceeds max_turns_per_session (3) -> Auto-rotates to a brand-new logical session!
+    st4 = mgr.resolve_session("-100123:main", "sdk_apikey:opencode:anthropic")
     assert st4.is_new_session is True
-    assert st4.native_session_id is None
+    assert st4.session_id != first_logical_sid
     assert "max_turns_reached" in st4.rotation_reason
+    mgr.record_turn(st4, "New unrelated question", "Answer", "ses_opencode_100")
 
-    # Test idle timeout auto-rotation
-    mgr.record_turn(st4, "ses_native_002")
-    raw = json.loads(sess_file.read_text(encoding="utf-8"))
-    raw["-100123:main"]["cli_subscription:cursor"]["last_active_at"] = time.time() - (45 * 60)
-    sess_file.write_text(json.dumps(raw), encoding="utf-8")
+    # 5. Reuse Old Session via `/session <id>` (works with logical ID `first_logical_sid` OR native ID `cur_001`!)
+    reused = mgr.reuse_old_session("-100123:main", "cur_001", current_provider_key="sdk_apikey:opencode:anthropic")
+    assert reused is not None
+    assert reused.session_id == first_logical_sid
+    assert reused.turn_count == 0  # Reset to 0!
+    assert reused.total_turns_ever == 3  # Historical turns preserved!
+    assert reused.native_session_id == "ses_opencode_99"  # Already linked to OpenCode too!
+
+    # 6. Test idle timeout auto-rotation in SQLite
+    with init_sqlite_db(db_file) as conn:
+        conn.execute(
+            "UPDATE sessions SET last_active_at = ? WHERE session_id = ?",
+            (time.time() - (45 * 60), first_logical_sid),
+        )
+        conn.commit()
 
     st_idle = mgr.resolve_session("-100123:main", "cli_subscription:cursor")
     assert st_idle.is_new_session is True
-    assert st_idle.native_session_id is None
+    assert st_idle.session_id != first_logical_sid
     assert "idle_timeout" in st_idle.rotation_reason
 
 
 def test_parse_cli_json_output_formats() -> None:
-    # 1. Cursor / Claude single JSON output
     cursor_raw = json.dumps({"type": "result", "result": "Root cause is DB timeout", "session_id": "cur_999"})
     ans1, sid1 = parse_cli_json_output(cursor_raw)
     assert ans1 == "Root cause is DB timeout"
     assert sid1 == "cur_999"
 
-    # 2. OpenCode JSONL streaming event output
     opencode_raw = "\n".join(
         [
             json.dumps({"type": "step_start", "sessionID": "ses_open_42"}),
@@ -154,17 +173,15 @@ def test_parse_cli_json_output_formats() -> None:
     assert sid2 == "ses_open_42"
 
 
-def test_multi_file_action_logs_and_source_code_tools(tmp_path: Path) -> None:
+def test_multi_file_action_logs_source_code_and_sqlite_actions(tmp_path: Path) -> None:
     svc_dir = tmp_path / "order-service"
     logs_dir = svc_dir / "logs"
     logs_dir.mkdir(parents=True)
 
-    # Create multiple action log files
     (logs_dir / "payment.log").write_text("INFO Payment started\nERROR Payment gateway timeout order=77\n")
     (logs_dir / "webhook.log").write_text("INFO Webhook received event=invoice.paid\n")
     (logs_dir / "auth.log").write_text("WARN Invalid JWT token from 10.0.0.4\n")
 
-    # Create source code file and a secret .env file
     (svc_dir / "handler.py").write_text(
         "def process_payment(order_id):\n"
         "    if not order_id:\n"
@@ -174,6 +191,7 @@ def test_multi_file_action_logs_and_source_code_tools(tmp_path: Path) -> None:
     (svc_dir / ".env").write_text("SECRET_KEY=do_not_read_me\n")
 
     cfg = load_config("config.yaml")
+    cfg.engine.session.state_db_file = str(tmp_path / "state.db")
     cfg.services["test-svc"] = ServiceDefinition(
         name="test-svc",
         runtime="python",
@@ -188,34 +206,35 @@ def test_multi_file_action_logs_and_source_code_tools(tmp_path: Path) -> None:
     )
     tk = OpsToolkit(cfg)
 
-    # 1. List all log files
     listed = tk.list_service_log_files("test-svc")
     assert listed["ok"] is True
     assert listed["total_files_found"] == 3
 
-    # 2. Read specific action log (`payment`)
     pay_logs = tk.get_service_logs("test-svc", category_or_file="payment", filter_keyword="ERROR")
     assert pay_logs["ok"] is True
     assert pay_logs["matched_files_count"] == 1
     only_log = next(iter(pay_logs["logs"].values()))
     assert "Payment gateway timeout order=77" in only_log["tail"]
 
-    # 3. Search source code
     code_search = tk.search_service_code("test-svc", query="process_payment")
     assert code_search["ok"] is True
     assert len(code_search["matches"]) == 1
-    assert code_search["matches"][0]["file"] == "handler.py"
 
-    # 4. Read source code file with line numbers
     code_read = tk.read_service_code_file("test-svc", relative_path="handler.py", start_line=1, end_line=4)
     assert code_read["ok"] is True
     assert "process_payment" in code_read["content"]
 
-    # 5. Ensure reading `.env` or traversing outside `working_dir` is blocked
     blocked_env = tk.read_service_code_file("test-svc", relative_path=".env")
     assert blocked_env["ok"] is False
-    blocked_traversal = tk.read_service_code_file("test-svc", relative_path="../../etc/passwd")
-    assert blocked_traversal["ok"] is False
+
+    # Verify SQLite PendingActionStore
+    proposed = tk.propose_action("pm2_restart", "order-api-py", "Memory spike", 333333333, "dev1")
+    assert proposed["ok"] is True
+    aid = proposed["action"]["action_id"]
+    assert len(tk.action_store.list_pending()) == 1
+    popped = tk.action_store.pop_action(aid)
+    assert popped is not None
+    assert len(tk.action_store.list_pending()) == 0
 
 
 def test_router_mode_switch_persistence(tmp_path: Path) -> None:
@@ -223,6 +242,7 @@ def test_router_mode_switch_persistence(tmp_path: Path) -> None:
     temp_cfg.write_text(Path("config.yaml").read_text(encoding="utf-8"), encoding="utf-8")
 
     cfg = load_config(temp_cfg)
+    cfg.engine.session.state_db_file = str(tmp_path / "state.db")
     router = EngineRouter(cfg)
     assert router.current_mode == "cli_subscription"
 

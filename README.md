@@ -9,9 +9,13 @@ A unified, session-aware Python debugging agent for **Windows Server** that lets
 1. **Dual-Mode Engine Switch (`config.yaml` or live via `/mode` in Telegram):**
    - **`cli_subscription` (Default — Cursor Subscription):** Uses your existing flat-rate **Cursor** subscription via Cursor CLI (`agent -p --output-format json --resume <id>`), or switch to `claude`, `codex`, or `gemini` CLI with one line in `config.yaml`.
    - **`sdk_apikey` (API Key Mode — Powered by OpenCode + Python SDK Fallback):** Uses **OpenCode** (`opencode run --format json --session <id>`) or **Pi** (`pi -p`) with your API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`), with automatic fallback to the built-in in-memory Python SDK loop.
-2. **Native Session Continuation & Automatic Rotation (Solves Telegram's Single-Chat Problem):**
-   - Tracks native CLI session IDs (`--resume <id>` for Cursor/Claude, `--session <id>` for OpenCode/Pi) per Telegram chat/topic in `.sessions.json`.
-   - **Continues the exact native session** while you are actively debugging back-and-forth.
+2. **SQLite Session Manager, Historical Session Reuse (`/session <id>`), & Cross-Tool Porting:**
+   - Stores all sessions, per-tool native CLI IDs (`cursor`, `claude`, `opencode`, `pi`), turn transcripts, pending approvals, and audit logs in a single SQLite database (`agent_state.db`).
+   - **Continues the exact native session** (`--resume <id>` for Cursor/Claude, `--session <id>` for OpenCode/Pi) while you are actively debugging back-and-forth.
+   - **Cross-Tool Session Porting:** If you start debugging in Cursor CLI (`cli_subscription`) and switch to OpenCode (`sdk_apikey`), the bot automatically seeds the prior SQLite transcript into OpenCode and links both native IDs under the same session!
+   - **Reuse Any Old Session (`/session <session_id>`):**
+     - Run `/session` to see the active session + recent historical sessions with one-click **`[🔁 Resume]`** buttons.
+     - Run `/session <session_id>` (using either the `s_...` ID or native Cursor/OpenCode ID) to reactivate an old session and **reset its turn counter to `0/15` and idle timer to `0m`**.
    - **Automatically starts a new session** when:
      - The chat has been quiet for **> 30 minutes** (`idle_timeout_minutes: 30`), OR
      - The session reaches **15 turns** (`max_turns_per_session: 15`), OR
@@ -134,8 +138,9 @@ pm2 save
 ## Telegram Commands & Session Controls
 
 - `/start` — Check your role (`Admin` vs `Viewer`), active engine mode, session policy, and registered services.
-- `/new` (or `/clear` or click **`[🔄 Start New Session]`**) — Force a fresh native debugging session immediately when switching topics.
-- `/session` — View the active native `session_id`, turn count (`e.g. 3/15`), and idle timer (`e.g. 4.2m / 30m`).
+- `/session` — View the active session + recent saved sessions from SQLite (with one-click **`[🔁 Resume]`** buttons).
+- `/session <session_id>` — Reuse any old session (accepts logical `s_...` ID or native Cursor/OpenCode session ID), **resetting its turn counter (`0/15`) and idle timer (`0.0m/30m`)**, and porting context across tools if you switched modes.
+- `/new` (or `/clear` or click **`[🔄 Start New Session]`**) — Force a fresh debugging session immediately when switching topics.
 - `/status` — Instant CPU, RAM, Disk, and multi-service health summary.
 - `/services` — List all configured services, action log categories, and code directories.
 - `/mode` — View or switch engine mode (`cli_subscription` | `sdk_apikey`).

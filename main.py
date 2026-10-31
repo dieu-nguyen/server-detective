@@ -32,6 +32,7 @@ def run_preflight_check(config_path: str) -> int:
         "sdk_apikey_provider": f"{cfg.engine.sdk_apikey.provider}:{cfg.engine.sdk_apikey.model}",
         "session_lifecycle": {
             "enabled": cfg.engine.session.enabled,
+            "state_db_file": cfg.engine.session.state_db_file,
             "idle_timeout_minutes": cfg.engine.session.idle_timeout_minutes,
             "max_turns_per_session": cfg.engine.session.max_turns_per_session,
         },

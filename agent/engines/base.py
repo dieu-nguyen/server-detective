@@ -18,9 +18,12 @@ class AgentTurnResult:
     provider_used: str
     pending_actions: List[Dict[str, Any]] = field(default_factory=list)
     tool_calls_made: List[str] = field(default_factory=list)
+    logical_session_id: str = ""
     native_session_id: Optional[str] = None
+    all_native_ids: Dict[str, str] = field(default_factory=dict)
     session_turn: int = 1
     is_new_session: bool = True
+    is_ported_across_tools: bool = False
     session_rotation_reason: str = ""
 
 

@@ -8,5 +8,8 @@ env/
 *.log
 .pending_actions.json
 .sessions.json
+agent_state.db
+agent_state.db-shm
+agent_state.db-wal
 audit.jsonl
 .pytest_cache/

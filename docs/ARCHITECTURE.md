@@ -10,13 +10,12 @@ It allows an engineering team to investigate outages, inspect **multiple action-
 1. **Single Switch Linking Auth Mode & Execution Engine (`cli_subscription` vs. `sdk_apikey`):**
    - `cli_subscription`: Uses a flat-rate monthly subscription (**Cursor CLI** default, or Claude Code / OpenAI Codex / Gemini CLI) by delegating the agentic reasoning loop to the official CLI binary (`agent -p --output-format json [--resume <id>]`).
    - `sdk_apikey`: Uses a pay-as-you-go API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`) powered by the **OpenCode CLI harness** (`opencode run --format json [--session <id>]`), **Pi CLI** (`pi -p`), or the built-in in-memory Python async SDK loop.
-2. **Native Session Continuation & Automatic Session Rotation (`agent/session_manager.py`):**
-   - Because Telegram is a single continuous chat stream, the bot tracks the native CLI `session_id` per Telegram `(chat_id, topic_id, provider)` in `.sessions.json`.
-   - Follow-up questions during an active investigation pass `--resume <session_id>` (Cursor/Claude) or `--session <session_id>` (OpenCode/Pi) so the agent preserves its exact native loop, file reads, and tool history.
-   - **When a New Session Starts:** The bot automatically rotates to a clean session when:
-     1. The chat has been quiet for > `idle_timeout_minutes` (default **30 minutes**).
-     2. The current session reaches `max_turns_per_session` (default **15 turns**).
-     3. Any teammate runs `/new` (or `/clear`) or taps the inline `[🔄 Start New Session]` button.
+2. **SQLite-Backed Session Manager & Cross-Tool Session Porting (`agent/session_manager.py`):**
+   - Stores all sessions, per-tool native CLI IDs (`cursor`, `claude`, `opencode`, `pi`), turn-by-turn message transcripts, pending approvals, and audit logs in a single ACID/WAL SQLite database (`agent_state.db`).
+   - **Cross-Tool Porting:** Each logical session (`s_...`) maps multiple provider native IDs (`session_native_ids`) AND stores the conversation transcript (`session_messages`). If a session starts in Cursor CLI (`cur_123`) and you switch to OpenCode API (`/mode sdk` or `/sdk`), the prior transcript from SQLite is automatically seeded into OpenCode's first turn, and OpenCode's new `ses_456` ID is linked to the **same** logical session!
+   - **Automatic Rotation & Historical Reuse (`/session <id>`):**
+     - Auto-rotates to a clean session after `idle_timeout_minutes` (**30 minutes**) or `max_turns_per_session` (**15 turns**), or via `/new`.
+     - Any historical session can be reactivated anytime via `/session <session_id>` (accepts either the logical `s_...` ID or the native Cursor/OpenCode ID, and **resets `turn_count = 0` and `idle_time = 0m`**).
 3. **Multi-File Action Logs & Source Code Inspection (`ops_toolkit.py`):**
    - Services that log different actions to different files (`payment.log`, `webhook.log`, `auth.log`, `scheduler.log`, `error.log`) are mapped via `logs_dir` and `log_files` in `config.yaml`.
    - Both engines can list all log files (`list_service_log_files`), tail/filter across one or all action logs (`get_service_logs`), and search/read source code jailed inside each service's `working_dir` (`search_service_code`, `read_service_code_file`).
@@ -27,78 +26,24 @@ It allows an engineering team to investigate outages, inspect **multiple action-
 
 ---
 
-## 2. High-Level Component Diagram
+## 2. SQLite Schema (`agent_state.db`)
 
 ```text
-Teammate / Admin on Mobile (Telegram DM or Shared Ops Group)
-        │
-        │  Outbound Long-Polling (HTTPS 443 — Zero Inbound Firewall Ports Needed)
-        ▼
-┌───────────────────────────────────────────────────────────────────────────┐
-│  1. Telegram Gateway & RBAC Layer (`agent/telegram_bot.py`)               │
-│     • Validates `allowed_group_ids`, `admins`, and `viewers`              │
-│     • Commands: `/status`, `/services`, `/mode`, `/new`, `/session`,      │
-│       `/cli`, `/sdk`                                                      │
-│     • Renders `[🔄 Start New Session]` + Admin `[Approve]` / `[Reject]`   │
-└─────────────────────────────────────┬─────────────────────────────────────┘
-                                      │
-                                      ▼
-┌───────────────────────────────────────────────────────────────────────────┐
-│  2. Unified Engine Router & Native Session Manager                        │
-│     (`agent/engines/router.py` + `agent/session_manager.py`)              │
-│     • Resolves native `session_id` for `(chat_id, topic_id, provider)`    │
-│     • Auto-rotates session if idle > 30m or turns >= 15 (or `/new`)       │
-│     • Captures new `session_id` from CLI JSON output (`parse_cli_json`)   │
-└──────────────────┬─────────────────────────────────────┬──────────────────┘
-                   │                                     │
-     mode: "cli_subscription"                  mode: "sdk_apikey"
-     (Subscription OAuth / CLI)                (Pay-as-you-go API Key)
-                   │                                     │
-                   ▼                                     ▼
-┌─────────────────────────────────────┐   ┌─────────────────────────────────┐
-│ 3A. CLI Subscription Engine         │   │ 3B. SDK / API Key Engine        │
-│ (`agent/engines/cli_subscription.py`│   │ (`agent/engines/sdk_apikey.py`) │
-├─────────────────────────────────────┤   ├─────────────────────────────────┤
-│ • Default: Cursor CLI               │   │ • Default Harness: **OpenCode** │
-│   `agent -p --output-format json`   │   │   `opencode run --format json`  │
-│   `[--resume <session_id>]`         │   │   `[--session <session_id>]`    │
-│ • Presets: `cursor`, `claude`,      │   │ • Alt Harness: `pi` or          │
-│   `codex`, `gemini`                 │   │   `python_sdk` (auto-fallback)  │
-└──────────────────┬──────────────────┘   └──────────────┬──────────────────┘
-                   │                                     │
-                   └──────────────────┬──────────────────┘
-                                      ▼
-┌───────────────────────────────────────────────────────────────────────────┐
-│  4. Shared Windows Server Operations Toolkit (`ops_toolkit.py`)           │
-├───────────────────────────────────────────────────────────────────────────┤
-│  Read-Only Diagnostic, Multi-Log, & Source Code Tools:                    │
-│  • `get_system_resources()`           (psutil CPU, RAM, Disks, Top PIDs)  │
-│  • `list_registered_services_status()`(All services & log categories)     │
-│  • `list_service_log_files()`         (All action logs, sizes, mtimes)    │
-│  • `get_service_logs()`               (Tail/filter 1 or all action logs)  │
-│  • `search_service_code()`            (Grep inside jailed `working_dir`)  │
-│  • `read_service_code_file()`         (Read numbered source code lines)   │
-│  • `get_pm2_status()` / `get_pm2_logs()` (`pm2 jlist` & `~/.pm2/logs`)    │
-│  • `get_windows_event_logs()`         (PowerShell `Get-WinEvent`)         │
-│  • `check_ngrok_status()`             (`127.0.0.1:4040/api/tunnels`+reqs) │
-│  • `check_n8n_status()`               (`127.0.0.1:5678/healthz` + logs)   │
-│  • `query_mysql_readonly()`           (Validated read-only `pymysql`)     │
-│                                                                           │
-│  Gated State-Changing Tools (Requires Admin Click in Telegram):           │
-│  • `propose_action()`  ──► Writes to `.pending_actions.json`              │
-│  • `execute_approved_action()` (Only called by Telegram callback handler) │
-└───────────────────────────────────────────────────────────────────────────┘
+agent_state.db (SQLite WAL Mode)
+├── sessions            (session_id PK, telegram_key, title, turn_count, total_turns_ever, is_active, created_at, last_active_at)
+├── session_native_ids  ((session_id, provider_key) PK, native_session_id, updated_at)
+├── session_messages    (id PK, session_id FK, role, content, provider_key, created_at)
+├── pending_actions     (action_id PK, action_type, target, reason, status, created_at, requested_by_user_id, requested_by_username)
+└── audit_logs          (id PK, timestamp_utc, timestamp_epoch, event_type, user_id, username, chat_id, engine_mode, details_json)
 ```
 
 ---
 
-## 3. Native Session Lifecycle in a Single Telegram Chat
+## 3. Session Lifecycle & Cross-Tool Porting in Telegram
 
-Because a Telegram DM or group topic is a single never-ending thread, `SessionManager` (`agent/session_manager.py`) manages native CLI session boundaries automatically:
-
-| Scenario in Telegram | What `SessionManager` Does | What Appears in Telegram Reply Header |
+| Scenario in Telegram | What `SessionManager` (`agent_state.db`) Does | What Appears in Telegram Reply Header |
 | :--- | :--- | :--- |
-| **First question** on an incident | Runs CLI without `--resume`/`--session`, injects full system prompt, captures `session_id` from JSON stdout, saves to `.sessions.json`. | `🆕 Session ses_8f9a1b (Turn 1/15)` |
-| **Follow-up question 3 mins later** (*"Check the payment log and trace line 84 in code"*) | Sees `idle < 30m` and `turns < 15`. Passes `--resume ses_8f9a1b` (Cursor/Claude) or `--session ses_8f9a1b` (OpenCode) so the CLI continues its exact native agent loop. | `🔗 Resumed ses_8f9a1b (Turn 2/15)` |
-| **Next message 2 hours later** (New incident) | Sees `idle > 30m`. Discards old `session_id` and starts a clean native session automatically. | `🆕 Session ses_4c2d9e (Turn 1/15 — auto-rotated: idle_timeout)` |
-| **Teammate types `/new` or clicks `[🔄 Start New Session]`** | Immediately clears active `session_id` for that chat/topic so the next question starts fresh. | `🆕 Started a fresh debugging session` |
+| **First question** on an incident (e.g. in Cursor CLI) | Creates logical session `s_a1b2c3d4`, runs `agent -p --output-format json`, captures native ID `cur_991`, links `(s_a1b2c3d4, cli_subscription:cursor) -> cur_991`. | `🆕 Session s_a1b2c3d4 (native: cur_991 • Turn 1/15)` |
+| **Follow-up question 3 mins later** in same mode | Sees `idle < 30m` and `turns < 15`. Passes `--resume cur_991` so Cursor CLI continues its exact native loop. | `🔗 Resumed s_a1b2c3d4 (native: cur_991 • Turn 2/15)` |
+| **Switch to `/mode sdk` (OpenCode) mid-incident** | Sees `s_a1b2c3d4` has no OpenCode native ID yet. Seeds the prior SQLite transcript into `opencode run --format json`, captures `ses_open88`, and links `(s_a1b2c3d4, sdk_apikey:opencode) -> ses_open88`. | `🔀 Ported Session s_a1b2c3d4 ➔ ses_open88 (Turn 3/15)` |
+| **Reuse an old session days later (`/session s_a1b2c3d4` or `/session cur_991`)** | Marks `s_a1b2c3d4` active again, **resets `turn_count = 0/15` and `idle_timer = 0.0m`**, and resumes the matching native ID for the current mode! | `🔁 Session s_a1b2c3d4 Reactivated! Turn Counter Reset: 0/15, Idle Timer Reset: 0.0m` |

@@ -1,7 +1,7 @@
 """
 Telegram Gateway with Team Role-Based Access Control (RBAC), Mode Switching,
-Native Session Lifecycle Controls (`/new`, `/session`, `[🔄 New Session]` button),
-Audit Logging, and Interactive Admin Approval Buttons.
+SQLite-Backed Session Reuse (`/session`, `/session <id>`, `[🔁 Resume]` buttons),
+Cross-Tool Session Porting, Audit Logging, and Interactive Admin Approval Buttons.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import asyncio
 import json
 import os
 import time
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -70,14 +70,37 @@ def build_session_footer_keyboard(session_key: str) -> InlineKeyboardMarkup:
     )
 
 
+def build_session_list_keyboard(
+    session_key: str,
+    recent_sessions: List[Dict[str, Any]],
+) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for item in recent_sessions[:5]:
+        sid = item["session_id"]
+        title_short = (item.get("title") or sid)[:24]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🔁 Resume {sid} ({title_short})",
+                    callback_data=f"resume_sess:{sid}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("🔄 Start New Session", callback_data=f"new_session:{session_key}")])
+    return InlineKeyboardMarkup(rows)
+
+
 class TelegramOpsBot:
-    """Telegram Bot wrapping `EngineRouter`, `OpsToolkit`, Native Session Manager, and Team RBAC."""
+    """Telegram Bot wrapping `EngineRouter`, `OpsToolkit`, SQLite Session Manager, and Team RBAC."""
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.toolkit = OpsToolkit(config)
         self.router = EngineRouter(config, self.toolkit)
-        self.audit = AuditLogger(config.engine.audit_log_file)
+        self.audit = AuditLogger(
+            file_path=config.engine.audit_log_file,
+            db_path=config.engine.session.state_db_file,
+        )
 
     def _session_key(self, update: Update) -> str:
         chat_id = update.effective_chat.id if update.effective_chat else 0
@@ -128,12 +151,14 @@ class TelegramOpsBot:
             f"• **Active Engine Mode:** `{mode}`\n"
             f"• **CLI Subscription Provider:** `{sub_provider}`\n"
             f"• **SDK API Key Harness:** `{sdk_provider}`\n"
+            f"• **Session Store:** SQLite (`{sess_cfg.state_db_file}`)\n"
             f"• **Session Auto-Rotation:** Idle > `{sess_cfg.idle_timeout_minutes}m` or > `{sess_cfg.max_turns_per_session}` turns\n"
             f"• **Registered Services:** `{', '.join(self.config.services.keys()) or 'None'}`\n\n"
             "**Commands:**\n"
             "• Ask any question in natural language to debug services, multi-file logs, source code, PM2, ngrok, n8n, or MySQL.\n"
-            "• `/new` (or `/clear`) — Start a brand-new native debugging session\n"
-            "• `/session` — Inspect active native session ID, turn count, and idle timer\n"
+            "• `/session` — View active & recent sessions (with `[🔁 Resume]` buttons)\n"
+            "• `/session <session_id>` — Reuse any old session (resets turn count to `0` & idle timer to `0m`, and ports context across Cursor/OpenCode!)\n"
+            "• `/new` (or `/clear`) — Start a brand-new debugging session\n"
             "• `/status` — Quick snapshot of system resources & all registered services\n"
             "• `/services` — List all configured services, action log categories, & code paths\n"
             "• `/mode` — View or switch engine (`cli_subscription` | `sdk_apikey`)\n"
@@ -223,13 +248,14 @@ class TelegramOpsBot:
                 engine_mode=new_mode,
             )
             await update.effective_message.reply_text(
-                f"✅ Engine mode switched to `{new_mode}` and saved to `{self.config.config_path}`."
+                f"✅ Engine mode switched to `{new_mode}` and saved to `{self.config.config_path}`.\n"
+                "*(Active sessions in SQLite will automatically port their context across tools!)*"
             )
         except ValueError as exc:
             await update.effective_message.reply_text(f"❌ {exc}")
 
     async def cmd_new_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Start a brand-new native debugging session (`/new` or `/clear`)."""
+        """Start a brand-new debugging session (`/new` or `/clear`)."""
         if not self._check_access(update):
             await self._deny_access(update)
             return
@@ -238,43 +264,104 @@ class TelegramOpsBot:
         if update.effective_message:
             await update.effective_message.reply_text(
                 "🆕 **Started a fresh debugging session** for this chat/topic.\n"
-                "Your next message will begin a clean native session (`turn 1`)."
+                "Your next message will begin a clean session (`turn 1`), while previous sessions remain saved in SQLite (`/session` to view or reuse)."
             )
 
     async def cmd_session_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Inspect active native CLI session IDs, turn counts, and idle timers for this chat."""
+        """
+        `/session` -> Show active session + recent sessions in SQLite with `[🔁 Resume]` buttons.
+        `/session <session_id>` -> Reuse/reactivate `<session_id>`, resetting turn_count=0 and idle_time=0m!
+        """
         if not self._check_access(update):
             await self._deny_access(update)
             return
-        if not update.effective_message:
+        if not update.effective_message or not update.effective_user:
             return
 
         s_key = self._session_key(update)
-        info = self.router.get_session_status(s_key)
         sess_cfg = self.config.engine.session
-        if not info:
+        args = context.args or []
+
+        # Case 1: `/session <session_id>` -> Reuse specified session & reset counters
+        if args:
+            target_id = args[0].strip()
+            resumed = self.router.reuse_session(s_key, target_id)
+            if not resumed:
+                await update.effective_message.reply_text(
+                    f"❌ Session `{target_id}` was not found in SQLite (`{sess_cfg.state_db_file}`).\n"
+                    "Run `/session` without arguments to see all saved session IDs."
+                )
+                return
+
+            self.audit.log(
+                event_type="session_reused",
+                user_id=update.effective_user.id,
+                username=update.effective_user.username or "",
+                chat_id=update.effective_chat.id if update.effective_chat else None,
+                engine_mode=self.router.current_mode,
+                details={"session_id": resumed.session_id, "target_input": target_id},
+            )
+            native_summary = (
+                ", ".join(f"{k}=`{v}`" for k, v in resumed.all_native_ids.items()) or "will bind on next turn"
+            )
+            port_note = (
+                "\n• **Cross-Tool Porting:** Prior transcript will automatically seed into the current engine on your next message!"
+                if resumed.is_ported_across_tools
+                else ""
+            )
             await update.effective_message.reply_text(
-                f"ℹ️ **No active native session** for `{s_key}`.\n"
-                f"• Auto-expiry policy: `{sess_cfg.idle_timeout_minutes}m` idle or `{sess_cfg.max_turns_per_session}` max turns."
+                f"🔁 **Session `{resumed.session_id}` Reactivated!**\n"
+                f"• **Topic:** {resumed.title or '(Untitled)'}\n"
+                f"• **Turn Counter Reset:** `0 / {sess_cfg.max_turns_per_session}` (Total historical turns: `{resumed.total_turns_ever}`)\n"
+                f"• **Idle Timer Reset:** `0.0m / {sess_cfg.idle_timeout_minutes}m`\n"
+                f"• **Linked Native Tool IDs:** {native_summary}"
+                f"{port_note}"
             )
             return
 
+        # Case 2: `/session` (no args) -> Show active session + historical sessions from SQLite
+        overview = self.router.get_session_status(s_key, limit=8)
+        active = overview.get("active_session")
+        recent = overview.get("recent_sessions") or []
         now = time.time()
+
         lines = [
-            f"🧵 **Active Native Sessions for `{s_key}`**",
-            f"• Policy: Auto-rotates after `{sess_cfg.idle_timeout_minutes}m` idle or `{sess_cfg.max_turns_per_session}` turns.",
+            f"🧵 **SQLite Session Manager (`{s_key}`)**",
+            f"• **Auto-Rotation Policy:** `{sess_cfg.idle_timeout_minutes}m` idle or `{sess_cfg.max_turns_per_session}` turns",
+            "• **Reuse Any Session:** `/session <session_id>` (resets turn count & idle timer)",
         ]
-        for prov_key, rec in info.items():
-            idle_mins = round((now - float(rec.get("last_active_at", now))) / 60, 1)
-            lines.append(
-                f"\n**Provider `{prov_key}`:**\n"
-                f"  • Native Session ID: `{rec.get('native_session_id') or 'in-memory'}`\n"
-                f"  • Turns used: `{rec.get('turn_count', 0)} / {sess_cfg.max_turns_per_session}`\n"
-                f"  • Idle time: `{idle_mins}m` (expires at `{sess_cfg.idle_timeout_minutes}m`)"
+
+        if active:
+            idle_mins = round((now - float(active["last_active_at"])) / 60, 1)
+            native_str = (
+                ", ".join(f"`{k.split(':')[0]}={v}`" for k, v in (active.get("native_ids") or {}).items())
+                or "in-memory"
             )
+            lines.append(
+                f"\n🟢 **Active Session: `{active['session_id']}`**\n"
+                f"  • Title: _{active['title']}_\n"
+                f"  • Window Turns: `{active['turn_count']} / {sess_cfg.max_turns_per_session}` "
+                f"(Total turns: `{active['total_turns_ever']}`)\n"
+                f"  • Idle Time: `{idle_mins}m / {sess_cfg.idle_timeout_minutes}m`\n"
+                f"  • Native Tool IDs: {native_str}"
+            )
+        else:
+            lines.append("\n⚪ **Active Session:** _None (next message starts a new session)_")
+
+        if recent:
+            lines.append("\n📚 **Recent Saved Sessions (tap button or run `/session <id>`):**")
+            for r in recent[:6]:
+                age_mins = int((now - float(r["last_active_at"])) // 60)
+                age_str = f"{age_mins}m ago" if age_mins < 120 else f"{round(age_mins / 60, 1)}h ago"
+                n_ids = ", ".join(f"`{v}`" for v in (r.get("native_ids") or {}).values()) or "no-cli-id"
+                lines.append(
+                    f"• `{r['session_id']}` (native: {n_ids}) — _{r['title']}_ "
+                    f"[turns: `{r['total_turns_ever']}`, {age_str}]"
+                )
+
         await update.effective_message.reply_text(
             "\n".join(lines),
-            reply_markup=build_session_footer_keyboard(s_key),
+            reply_markup=build_session_list_keyboard(s_key, recent),
         )
 
     async def cmd_force_cli(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -360,16 +447,26 @@ class TelegramOpsBot:
             return
 
         max_turns = self.config.engine.session.max_turns_per_session
-        sid_short = (result.native_session_id or "mem")[:10]
+        logical_id = result.logical_session_id or "s_mem"
+        native_short = (result.native_session_id or "mem")[:12]
+
         if result.is_new_session:
             reason_note = (
                 f" — auto-rotated: {result.session_rotation_reason}"
                 if result.session_rotation_reason not in ("", "first_turn")
                 else ""
             )
-            session_badge = f"🆕 Session `{sid_short}` (Turn {result.session_turn}/{max_turns}{reason_note})"
+            session_badge = (
+                f"🆕 Session `{logical_id}` (native: `{native_short}` • Turn {result.session_turn}/{max_turns}{reason_note})"
+            )
+        elif result.is_ported_across_tools:
+            session_badge = (
+                f"🔀 Ported Session `{logical_id}` ➔ `{native_short}` (Turn {result.session_turn}/{max_turns})"
+            )
         else:
-            session_badge = f"🔗 Resumed `{sid_short}` (Turn {result.session_turn}/{max_turns})"
+            session_badge = (
+                f"🔗 Resumed `{logical_id}` (native: `{native_short}` • Turn {result.session_turn}/{max_turns})"
+            )
 
         header = f"🤖 **[{result.engine_used} • {result.provider_used}]**\n{session_badge}\n\n"
         full_reply = header + result.answer
@@ -406,7 +503,7 @@ class TelegramOpsBot:
             )
 
     # -------------------------------------------------------------------------
-    # Callback Query Handler (New Session Button + Admin Approval Buttons)
+    # Callback Query Handler (New Session + Resume Session + Admin Approvals)
     # -------------------------------------------------------------------------
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -420,10 +517,10 @@ class TelegramOpsBot:
             return
 
         decision, payload = parts[0], parts[1]
+        chat_id = update.effective_chat.id if update.effective_chat else 0
 
-        # Any authorized viewer/admin can start a new session
+        # 1. Start a fresh session button (`new_session:<session_key>`)
         if decision == "new_session":
-            chat_id = update.effective_chat.id if update.effective_chat else 0
             if not self.config.is_authorized(user.id, chat_id):
                 await query.answer("⛔ Unauthorized.", show_alert=True)
                 return
@@ -436,7 +533,28 @@ class TelegramOpsBot:
                 )
             return
 
-        # Only Admins can approve or reject state-changing server actions
+        # 2. Resume a saved session button (`resume_sess:<session_id>`)
+        if decision == "resume_sess":
+            if not self.config.is_authorized(user.id, chat_id):
+                await query.answer("⛔ Unauthorized.", show_alert=True)
+                return
+            s_key = self._session_key(update)
+            resumed = self.router.reuse_session(s_key, payload)
+            if not resumed:
+                await query.answer("Session not found.", show_alert=True)
+                return
+            sess_cfg = self.config.engine.session
+            await query.answer(f"Resumed session {resumed.session_id}!")
+            if query.message:
+                await query.message.reply_text(
+                    f"🔁 **Session `{resumed.session_id}` Reactivated** by @{user.username or user.id}!\n"
+                    f"• **Topic:** {resumed.title or '(Untitled)'}\n"
+                    f"• **Turn Counter Reset:** `0 / {sess_cfg.max_turns_per_session}`\n"
+                    f"• **Idle Timer Reset:** `0.0m / {sess_cfg.idle_timeout_minutes}m`"
+                )
+            return
+
+        # 3. Admin-only approval buttons (`approve:<action_id>` / `reject:<action_id>`)
         if not self.config.is_admin(user.id):
             await query.answer("⛔ Only Admins listed in config.yaml can approve or reject actions.", show_alert=True)
             self.audit.log(

@@ -108,10 +108,15 @@ def validate_readonly_sql(sql: str, max_rows: int = 50) -> Tuple[bool, str, str]
 
 
 class AuditLogger:
-    """Append-only JSONL audit logger for team accountability."""
+    """Dual SQLite (`agent_state.db`) + JSONL audit logger for team accountability."""
 
-    def __init__(self, file_path: str | Path = "./audit.jsonl") -> None:
+    def __init__(
+        self,
+        file_path: str | Path = "./audit.jsonl",
+        db_path: Optional[str | Path] = "./agent_state.db",
+    ) -> None:
         self.file_path = Path(file_path)
+        self.db_path = Path(db_path) if db_path else None
 
     def log(
         self,
@@ -122,15 +127,18 @@ class AuditLogger:
         engine_mode: str = "",
         details: Optional[Dict[str, Any]] = None,
     ) -> None:
+        ts_utc = datetime.now(timezone.utc).isoformat()
+        ts_epoch = time.time()
+        details_dict = details or {}
         record = {
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "timestamp_epoch": time.time(),
+            "timestamp_utc": ts_utc,
+            "timestamp_epoch": ts_epoch,
             "event_type": event_type,
             "user_id": user_id,
             "username": username,
             "chat_id": chat_id,
             "engine_mode": engine_mode,
-            "details": details or {},
+            "details": details_dict,
         }
         try:
             self.file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -138,3 +146,30 @@ class AuditLogger:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception:
             pass
+
+        if self.db_path:
+            try:
+                from agent.session_manager import init_sqlite_db
+
+                with init_sqlite_db(self.db_path) as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO audit_logs (
+                            timestamp_utc, timestamp_epoch, event_type,
+                            user_id, username, chat_id, engine_mode, details_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            ts_utc,
+                            ts_epoch,
+                            event_type,
+                            user_id,
+                            username,
+                            chat_id,
+                            engine_mode,
+                            json.dumps(details_dict, ensure_ascii=False),
+                        ),
+                    )
+                    conn.commit()
+            except Exception:
+                pass

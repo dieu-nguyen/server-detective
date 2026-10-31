@@ -12,10 +12,11 @@ from dotenv import load_dotenv
 
 @dataclass
 class SessionConfig:
-    """Controls native CLI/SDK session continuation and automatic rotation in Telegram."""
+    """Controls SQLite-backed native CLI/SDK session continuation, cross-tool porting, and auto-rotation."""
 
     enabled: bool = True
-    sessions_file: str = "./.sessions.json"
+    state_db_file: str = "./agent_state.db"
+    sessions_file: str = "./agent_state.db"  # Alias for backwards compatibility
     idle_timeout_minutes: int = 30  # Auto-start a fresh native session if chat was quiet > 30 mins
     max_turns_per_session: int = 15  # Auto-rotate session after N turns to prevent context bloat
     show_new_session_button: bool = True  # Show inline [🔄 New Session] button on replies
@@ -193,9 +194,16 @@ def load_config(config_path: str | Path = "config.yaml", env_path: Optional[str 
     cli_raw = eng_raw.get("cli_subscription", {}) or {}
     sdk_raw = eng_raw.get("sdk_apikey", {}) or {}
 
+    db_file = str(
+        sess_raw.get("state_db_file")
+        or sess_raw.get("sessions_file")
+        or eng_raw.get("state_db_file")
+        or "./agent_state.db"
+    )
     session_cfg = SessionConfig(
         enabled=bool(sess_raw.get("enabled", True)),
-        sessions_file=str(sess_raw.get("sessions_file", "./.sessions.json")),
+        state_db_file=db_file,
+        sessions_file=db_file,
         idle_timeout_minutes=int(sess_raw.get("idle_timeout_minutes", 30)),
         max_turns_per_session=int(sess_raw.get("max_turns_per_session", 15)),
         show_new_session_button=bool(sess_raw.get("show_new_session_button", True)),

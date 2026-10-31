@@ -24,16 +24,17 @@ engine:
   audit_log_file: "./audit.jsonl"
   pending_actions_file: "./.pending_actions.json"
 
-  # --- Native Session Lifecycle (When to Resume vs Start a New Chat Session) ---
-  # Because Telegram is a single continuous chat, the bot tracks the native CLI
-  # session_id (Cursor `--resume <id>`, OpenCode `--session <id>`, Claude `--resume <id>`)
-  # and automatically starts a fresh session when any of these conditions occur:
+  # --- SQLite Session Lifecycle & Cross-Tool Porting (`agent_state.db`) ---
+  # Stores all sessions, per-tool native IDs (`cursor`, `claude`, `opencode`, `pi`),
+  # turn transcripts, pending approvals, and audit logs in a single SQLite DB (`agent_state.db`).
+  # Automatically starts a fresh session when any of these conditions occur:
   #   1. The chat has been idle for > `idle_timeout_minutes` (default 30 mins)
   #   2. The current session reaches `max_turns_per_session` (default 15 turns)
   #   3. A user types `/new` (or `/clear`) or clicks the [🔄 New Session] button
+  # Reuse any old session anytime with `/session <session_id>` (resets turn count & idle timer!).
   session:
     enabled: true
-    sessions_file: "./.sessions.json"
+    state_db_file: "./agent_state.db"
     idle_timeout_minutes: 30        # Auto-rotate to a fresh session after 30 mins of silence
     max_turns_per_session: 15       # Auto-rotate after 15 back-and-forth turns
     show_new_session_button: true   # Attach [🔄 New Session] button to replies

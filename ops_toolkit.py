@@ -100,29 +100,21 @@ def _tail_file(file_path: Path, lines: int = 100, filter_keyword: str = "") -> s
 
 
 class PendingActionStore:
-    """Thread/process-safe JSON store for gated admin actions awaiting Telegram button click."""
+    """SQLite-backed store for gated admin actions awaiting Telegram button click."""
 
-    def __init__(self, file_path: str | Path = "./.pending_actions.json", expiry_seconds: int = 600) -> None:
-        self.file_path = Path(file_path)
+    def __init__(self, file_path: str | Path = "./agent_state.db", expiry_seconds: int = 600) -> None:
+        self.db_path = Path(file_path)
         self.expiry_seconds = expiry_seconds
 
-    def _load_all(self) -> Dict[str, Dict[str, Any]]:
-        if not self.file_path.exists():
-            return {}
-        try:
-            data = json.loads(self.file_path.read_text(encoding="utf-8"))
-            now = time.time()
-            return {
-                k: v
-                for k, v in data.items()
-                if isinstance(v, dict) and (now - float(v.get("created_at", 0))) < self.expiry_seconds
-            }
-        except Exception:
-            return {}
+    def _conn(self):
+        from agent.session_manager import init_sqlite_db
 
-    def _save_all(self, actions: Dict[str, Dict[str, Any]]) -> None:
-        self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        self.file_path.write_text(json.dumps(actions, indent=2, ensure_ascii=False), encoding="utf-8")
+        return init_sqlite_db(self.db_path)
+
+    def _prune_expired(self, conn) -> None:
+        cutoff = time.time() - self.expiry_seconds
+        conn.execute("DELETE FROM pending_actions WHERE created_at < ?", (cutoff,))
+        conn.commit()
 
     def create_action(
         self,
@@ -132,33 +124,67 @@ class PendingActionStore:
         requested_by_user_id: Optional[int] = None,
         requested_by_username: str = "",
     ) -> Dict[str, Any]:
-        actions = self._load_all()
         action_id = uuid.uuid4().hex[:8]
+        now = time.time()
         record = {
             "action_id": action_id,
             "action_type": action_type,
             "target": target,
             "reason": reason,
             "status": "pending",
-            "created_at": time.time(),
+            "created_at": now,
             "requested_by_user_id": requested_by_user_id,
-            "requested_by_username": requested_by_username,
+            "requested_by_username": requested_by_username or "",
         }
-        actions[action_id] = record
-        self._save_all(actions)
+        with self._conn() as conn:
+            self._prune_expired(conn)
+            conn.execute(
+                """
+                INSERT INTO pending_actions (
+                    action_id, action_type, target, reason, status,
+                    created_at, requested_by_user_id, requested_by_username
+                ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
+                """,
+                (
+                    action_id,
+                    action_type,
+                    target,
+                    reason,
+                    now,
+                    requested_by_user_id,
+                    requested_by_username or "",
+                ),
+            )
+            conn.commit()
         return record
 
     def get_action(self, action_id: str) -> Optional[Dict[str, Any]]:
-        return self._load_all().get(action_id)
+        with self._conn() as conn:
+            self._prune_expired(conn)
+            row = conn.execute(
+                "SELECT * FROM pending_actions WHERE action_id = ?", (action_id,)
+            ).fetchone()
+            return dict(row) if row else None
 
     def list_pending(self) -> List[Dict[str, Any]]:
-        return [a for a in self._load_all().values() if a.get("status") == "pending"]
+        with self._conn() as conn:
+            self._prune_expired(conn)
+            rows = conn.execute(
+                "SELECT * FROM pending_actions WHERE status = 'pending' ORDER BY created_at ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def pop_action(self, action_id: str) -> Optional[Dict[str, Any]]:
-        actions = self._load_all()
-        item = actions.pop(action_id, None)
-        self._save_all(actions)
-        return item
+        with self._conn() as conn:
+            self._prune_expired(conn)
+            row = conn.execute(
+                "SELECT * FROM pending_actions WHERE action_id = ?", (action_id,)
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute("DELETE FROM pending_actions WHERE action_id = ?", (action_id,))
+            conn.commit()
+            return dict(row)
 
 
 class OpsToolkit:
@@ -173,8 +199,9 @@ class OpsToolkit:
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        state_db = config.engine.session.state_db_file or config.engine.pending_actions_file
         self.action_store = PendingActionStore(
-            file_path=config.engine.pending_actions_file,
+            file_path=state_db,
             expiry_seconds=config.telegram.action_expiry_seconds,
         )
 
