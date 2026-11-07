@@ -152,6 +152,7 @@ class SDKApiKeyEngine:
             env["OPENCODE_CONFIG_CONTENT"] = json.dumps(self.build_opencode_permissions_json())
 
         async with self._semaphore:
+            proc = None
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *argv,
@@ -170,19 +171,26 @@ class SDKApiKeyEngine:
                     f"Install OpenCode (`npm install -g opencode-ai`) on the server or switch `engine.mode` to `cli_subscription`."
                 )
             except asyncio.TimeoutError:
+                if proc is not None and proc.returncode is None:
+                    proc.kill()
+                    try:
+                        await proc.wait()
+                    except Exception:
+                        pass
                 raise RuntimeError(f"API Key harness (`{harness}`) timed out after {sdk_cfg.timeout_seconds}s.")
 
         raw_stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
         raw_stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
 
-        if proc.returncode != 0 and not raw_stdout:
-            raise RuntimeError(
-                f"API Key harness (`{harness}`) exited with code {proc.returncode}: "
-                f"{redact_secrets(raw_stderr) or 'Unknown error'}"
-            )
-
         parsed_text, extracted_session_id = parse_cli_json_output(raw_stdout)
         answer = redact_secrets(parsed_text or raw_stderr or "Completed.")
+        if proc.returncode != 0:
+            err = redact_secrets(raw_stderr)[:1500] or "Unknown error"
+            if not raw_stdout:
+                raise RuntimeError(
+                    f"API Key harness (`{harness}`) exited with code {proc.returncode}: {err}"
+                )
+            answer = f"⚠️ API Key harness exited with code {proc.returncode}.\n{err}\n\n{answer}"
 
         after_actions = self.toolkit.action_store.list_pending()
         new_actions = [a for a in after_actions if a["action_id"] not in before_ids]

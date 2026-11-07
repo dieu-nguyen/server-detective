@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -424,6 +427,44 @@ class TelegramOpsBot:
 
         await self._process_question(update, text, override_mode=None)
 
+    async def _deliver_chunks(
+        self,
+        status_msg: Any,
+        fallback_msg: Any,
+        chunks: List[str],
+        last_markup: Any = None,
+    ) -> None:
+        """Always try to put the turn outcome in Telegram (edit Investigating, else new reply)."""
+        if not chunks:
+            chunks = ["(Empty response)"]
+        first_markup = last_markup if len(chunks) == 1 else None
+        posted = False
+        if status_msg is not None:
+            try:
+                await status_msg.edit_text(chunks[0], reply_markup=first_markup)
+                posted = True
+            except Exception:
+                logger.exception("Failed to edit Investigating message; sending a new reply")
+        if not posted:
+            if fallback_msg is None:
+                raise RuntimeError("No Telegram message available to deliver the agent result.")
+            await fallback_msg.reply_text(chunks[0], reply_markup=first_markup)
+        for index, extra in enumerate(chunks[1:]):
+            markup = last_markup if index == len(chunks) - 2 else None
+            await fallback_msg.reply_text(extra, reply_markup=markup)
+
+    async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Catch-all: any unhandled handler exception still gets a Telegram reply."""
+        err = redact_secrets(str(getattr(context, "error", None) or "Unknown error"))
+        logger.exception("Unhandled Telegram handler error: %s", err)
+        target = update.effective_message if isinstance(update, Update) else None
+        if target is None:
+            return
+        try:
+            await target.reply_text(f"❌ **Bot Error:**\n{err}"[:TELEGRAM_MAX_LEN])
+        except Exception:
+            logger.exception("Failed to send Bot Error to Telegram")
+
     async def _process_question(
         self,
         update: Update,
@@ -452,17 +493,8 @@ class TelegramOpsBot:
             if active_mode == "cli_subscription"
             else self.config.engine.sdk_apikey.timeout_seconds
         )
-        turn_log = self.config.engine.cli_subscription.turn_log_file or "pm2 logs"
-        status_msg = await msg.reply_text(
-            f"🔍 Investigating on `{self.config.server_name}` via `{active_mode}`...\n"
-            f"_This stays here until Cursor CLI finishes (timeout {timeout_s}s). "
-            f"Live thinking/tools: `{turn_log}` (or `pm2 logs telegram-debug-agent`)._"
-        )
-        try:
-            await chat.send_action(ChatAction.TYPING)
-        except Exception:
-            pass
-
+        status_msg = None
+        heartbeat_task = None
         stop_heartbeat = asyncio.Event()
         started = time.monotonic()
 
@@ -473,11 +505,12 @@ class TelegramOpsBot:
                     return
                 except asyncio.TimeoutError:
                     elapsed = int(time.monotonic() - started)
+                    if status_msg is None:
+                        continue
                     try:
                         await status_msg.edit_text(
                             f"🔍 Investigating on `{self.config.server_name}` via `{active_mode}`...\n"
-                            f"_Still running: {elapsed}s / {timeout_s}s. "
-                            f"Tail `{turn_log}`._"
+                            f"_Still running: {elapsed}s / {timeout_s}s._"
                         )
                     except Exception:
                         pass
@@ -486,8 +519,21 @@ class TelegramOpsBot:
                     except Exception:
                         pass
 
-        heartbeat_task = asyncio.create_task(_heartbeat())
         try:
+            try:
+                status_msg = await msg.reply_text(
+                    f"🔍 Investigating on `{self.config.server_name}` via `{active_mode}`...\n"
+                    f"_Timeout {timeout_s}s. This message is replaced with the answer or any error._"
+                )
+            except Exception:
+                logger.exception("Failed to post Investigating status")
+
+            try:
+                await chat.send_action(ChatAction.TYPING)
+            except Exception:
+                pass
+
+            heartbeat_task = asyncio.create_task(_heartbeat())
             result = await self.router.handle_message(
                 session_key=s_key,
                 user_message=question,
@@ -495,73 +541,79 @@ class TelegramOpsBot:
                 requester_username=user.username or user.first_name or str(user.id),
                 override_mode=override_mode,
             )
+
+            max_turns = self.config.engine.session.max_turns_per_session
+            logical_id = result.logical_session_id or "s_mem"
+            native_short = (result.native_session_id or "mem")[:12]
+
+            if result.is_new_session:
+                reason_note = (
+                    f" — auto-rotated: {result.session_rotation_reason}"
+                    if result.session_rotation_reason not in ("", "first_turn")
+                    else ""
+                )
+                session_badge = (
+                    f"🆕 Session `{logical_id}` (native: `{native_short}` • Turn {result.session_turn}/{max_turns}{reason_note})"
+                )
+            elif result.is_ported_across_tools:
+                session_badge = (
+                    f"🔀 Ported Session `{logical_id}` ➔ `{native_short}` (Turn {result.session_turn}/{max_turns})"
+                )
+            else:
+                session_badge = (
+                    f"🔗 Resumed `{logical_id}` (native: `{native_short}` • Turn {result.session_turn}/{max_turns})"
+                )
+
+            header = f"🤖 **[{result.engine_used} • {result.provider_used}]**\n{session_badge}\n\n"
+            answer = (result.answer or "").strip() or "Investigation completed with no output."
+            chunks = limit_telegram_chunks(split_telegram_message(header + answer))
+            footer_markup = (
+                build_session_footer_keyboard(s_key)
+                if self.config.engine.session.show_new_session_button
+                else None
+            )
+            await self._deliver_chunks(status_msg, msg, chunks, last_markup=footer_markup)
+
+            for action in result.pending_actions:
+                card_text = (
+                    "🛡️ **Gated Action Approval Required**\n"
+                    f"• **Action ID:** `{action['action_id']}`\n"
+                    f"• **Operation:** `{action['action_type']}`\n"
+                    f"• **Target:** `{action['target']}`\n"
+                    f"• **Reason:** {action['reason']}\n"
+                    f"• **Requested by:** @{action.get('requested_by_username') or user.id}\n\n"
+                    "_Only users listed in `telegram.admins` can approve this action._"
+                )
+                try:
+                    await msg.reply_text(
+                        card_text,
+                        reply_markup=build_approval_keyboard(action["action_id"]),
+                    )
+                except Exception:
+                    logger.exception("Failed to post approval card %s", action.get("action_id"))
+                    await self._deliver_chunks(
+                        None,
+                        msg,
+                        limit_telegram_chunks(split_telegram_message(card_text)),
+                    )
         except Exception as exc:
-            err_text = redact_secrets(str(exc))
-            await status_msg.edit_text(f"❌ **Agent Error (`{active_mode}`):**\n{err_text}")
-            return
+            err_text = redact_secrets(str(exc)) or "Unknown error"
+            logger.exception("Agent turn failed; delivering error to Telegram")
+            error_chunks = limit_telegram_chunks(
+                split_telegram_message(f"❌ **Agent Error (`{active_mode}`):**\n{err_text}")
+            )
+            try:
+                await self._deliver_chunks(status_msg, msg, error_chunks)
+            except Exception:
+                logger.exception("Failed to deliver agent error to Telegram")
         finally:
             stop_heartbeat.set()
-            heartbeat_task.cancel()
-            try:
-                await heartbeat_task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-        max_turns = self.config.engine.session.max_turns_per_session
-        logical_id = result.logical_session_id or "s_mem"
-        native_short = (result.native_session_id or "mem")[:12]
-
-        if result.is_new_session:
-            reason_note = (
-                f" — auto-rotated: {result.session_rotation_reason}"
-                if result.session_rotation_reason not in ("", "first_turn")
-                else ""
-            )
-            session_badge = (
-                f"🆕 Session `{logical_id}` (native: `{native_short}` • Turn {result.session_turn}/{max_turns}{reason_note})"
-            )
-        elif result.is_ported_across_tools:
-            session_badge = (
-                f"🔀 Ported Session `{logical_id}` ➔ `{native_short}` (Turn {result.session_turn}/{max_turns})"
-            )
-        else:
-            session_badge = (
-                f"🔗 Resumed `{logical_id}` (native: `{native_short}` • Turn {result.session_turn}/{max_turns})"
-            )
-
-        header = f"🤖 **[{result.engine_used} • {result.provider_used}]**\n{session_badge}\n\n"
-        full_reply = header + result.answer
-        chunks = limit_telegram_chunks(split_telegram_message(full_reply))
-
-        footer_markup = (
-            build_session_footer_keyboard(s_key)
-            if self.config.engine.session.show_new_session_button
-            else None
-        )
-
-        if len(chunks) == 1:
-            await status_msg.edit_text(chunks[0], reply_markup=footer_markup)
-        else:
-            await status_msg.edit_text(chunks[0])
-            for extra_chunk in chunks[1:-1]:
-                await msg.reply_text(extra_chunk)
-            await msg.reply_text(chunks[-1], reply_markup=footer_markup)
-
-        # Render interactive [Approve] / [Reject] buttons for any gated actions queued during the turn
-        for action in result.pending_actions:
-            card_text = (
-                "🛡️ **Gated Action Approval Required**\n"
-                f"• **Action ID:** `{action['action_id']}`\n"
-                f"• **Operation:** `{action['action_type']}`\n"
-                f"• **Target:** `{action['target']}`\n"
-                f"• **Reason:** {action['reason']}\n"
-                f"• **Requested by:** @{action.get('requested_by_username') or user.id}\n\n"
-                "_Only users listed in `telegram.admins` can approve this action._"
-            )
-            await msg.reply_text(
-                card_text,
-                reply_markup=build_approval_keyboard(action["action_id"]),
-            )
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     # -------------------------------------------------------------------------
     # Callback Query Handler (New Session + Resume Session + Admin Approvals)
@@ -678,4 +730,5 @@ class TelegramOpsBot:
         app.add_handler(CommandHandler("sdk", self.cmd_force_sdk))
         app.add_handler(CallbackQueryHandler(self.handle_callback_query))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message))
+        app.add_error_handler(self.on_error)
         return app

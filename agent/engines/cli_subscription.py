@@ -398,14 +398,17 @@ class CLISubscriptionEngine:
         raw_stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
         raw_stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
 
-        if proc.returncode != 0 and not raw_stdout:
-            raise RuntimeError(
-                f"CLI Subscription engine (`{cli_cfg.provider}`) exited with code {proc.returncode}: "
-                f"{redact_secrets(raw_stderr) or 'Unknown CLI error'}"
-            )
-
         parsed_text, extracted_session_id = parse_cli_json_output(raw_stdout)
         answer = redact_secrets(parsed_text or raw_stderr or "Investigation completed with no output.")
+        if proc.returncode != 0:
+            err = redact_secrets(raw_stderr)[:1500] or "Unknown CLI error"
+            if not raw_stdout:
+                raise RuntimeError(
+                    f"CLI Subscription engine (`{cli_cfg.provider}`) exited with code {proc.returncode}: {err}"
+                )
+            answer = (
+                f"⚠️ Cursor CLI exited with code {proc.returncode}.\n{err}\n\n{answer}"
+            )
 
         after_actions = self.toolkit.action_store.list_pending()
         new_actions = [a for a in after_actions if a["action_id"] not in before_ids]
