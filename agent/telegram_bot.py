@@ -426,14 +426,45 @@ class TelegramOpsBot:
             details={"question": redact_secrets(question), "session_key": s_key},
         )
 
+        timeout_s = (
+            self.config.engine.cli_subscription.timeout_seconds
+            if active_mode == "cli_subscription"
+            else self.config.engine.sdk_apikey.timeout_seconds
+        )
         status_msg = await msg.reply_text(
-            f"🔍 Investigating on `{self.config.server_name}` via `{active_mode}`..."
+            f"🔍 Investigating on `{self.config.server_name}` via `{active_mode}`...\n"
+            f"_This stays here until Cursor CLI finishes (timeout {timeout_s}s). "
+            f"Watch `pm2 logs telegram-debug-agent` on the server._"
         )
         try:
             await chat.send_action(ChatAction.TYPING)
         except Exception:
             pass
 
+        stop_heartbeat = asyncio.Event()
+        started = time.monotonic()
+
+        async def _heartbeat() -> None:
+            while not stop_heartbeat.is_set():
+                try:
+                    await asyncio.wait_for(stop_heartbeat.wait(), timeout=20)
+                    return
+                except asyncio.TimeoutError:
+                    elapsed = int(time.monotonic() - started)
+                    try:
+                        await status_msg.edit_text(
+                            f"🔍 Investigating on `{self.config.server_name}` via `{active_mode}`...\n"
+                            f"_Still running: {elapsed}s / {timeout_s}s. "
+                            f"Check `pm2 logs telegram-debug-agent`._"
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        await chat.send_action(ChatAction.TYPING)
+                    except Exception:
+                        pass
+
+        heartbeat_task = asyncio.create_task(_heartbeat())
         try:
             result = await self.router.handle_message(
                 session_key=s_key,
@@ -446,6 +477,13 @@ class TelegramOpsBot:
             err_text = redact_secrets(str(exc))
             await status_msg.edit_text(f"❌ **Agent Error (`{active_mode}`):**\n{err_text}")
             return
+        finally:
+            stop_heartbeat.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         max_turns = self.config.engine.session.max_turns_per_session
         logical_id = result.logical_session_id or "s_mem"

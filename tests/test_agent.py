@@ -83,12 +83,18 @@ def test_cli_subscription_and_opencode_command_builders_with_sessions(tmp_path: 
     assert "--resume" not in cmd_cursor_new
     assert cmd_cursor_new[-1] == "check order-api-py"
     assert cmd_cursor_new.index("--trust") < cmd_cursor_new.index("check order-api-py")
+    assert cmd_cursor_new.index("--force") < cmd_cursor_new.index("check order-api-py")
     assert cmd_cursor_new.index("-p") < cmd_cursor_new.index("check order-api-py")
 
     cfg.engine.cli_subscription.trust_workspace = False
     cmd_cursor_untrusted = cli_engine.build_command("check order-api-py", resume_session_id=None)
     assert "--trust" not in cmd_cursor_untrusted
     cfg.engine.cli_subscription.trust_workspace = True
+
+    cfg.engine.cli_subscription.force_allow_commands = False
+    cmd_cursor_no_force = cli_engine.build_command("check order-api-py", resume_session_id=None)
+    assert "--force" not in cmd_cursor_no_force
+    cfg.engine.cli_subscription.force_allow_commands = True
 
     cmd_cursor_resume = cli_engine.build_command("check payment log", resume_session_id="chat_abc123")
     assert "--resume" in cmd_cursor_resume

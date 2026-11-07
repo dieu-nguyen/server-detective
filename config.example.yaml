@@ -86,6 +86,9 @@ engine:
     custom_command_template: []
     # Required for PM2 / Telegram: Cursor CLI otherwise exits asking to trust the cwd.
     trust_workspace: true
+    # Required for PM2 / Telegram: auto-approve shell commands (`--force` / `--yolo`).
+    # Without this, Cursor waits for a y/n prompt that Telegram cannot answer.
+    force_allow_commands: true
 
   # --- Mode B: SDK / API Key Configuration (OpenCode / Pi CLI Harness) ---
   sdk_apikey:

@@ -78,6 +78,8 @@ class CLISubscriptionConfig:
     custom_command_template: List[str] = field(default_factory=list)
     # Headless Telegram runs cannot answer Cursor CLI's workspace-trust prompt.
     trust_workspace: bool = True
+    # Headless Telegram cannot answer Cursor's y/n command-approval prompts.
+    force_allow_commands: bool = True
 
 
 @dataclass
@@ -271,6 +273,7 @@ def load_config(config_path: str | Path = "config.yaml", env_path: Optional[str 
         binaries=default_binaries,
         custom_command_template=list(cli_raw.get("custom_command_template", []) or []),
         trust_workspace=bool(cli_raw.get("trust_workspace", True)),
+        force_allow_commands=bool(cli_raw.get("force_allow_commands", True)),
     )
 
     sdk_cfg = SDKApiKeyConfig(

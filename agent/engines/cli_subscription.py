@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shlex
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from agent.config import AppConfig
 from agent.engines.base import AgentTurnResult, build_system_prompt
@@ -86,6 +89,8 @@ class CLISubscriptionEngine:
             cmd = [*bin_parts, "-p", "--output-format", "json"]
             if cli_cfg.trust_workspace:
                 cmd.append("--trust")
+            if cli_cfg.force_allow_commands:
+                cmd.append("--force")
             if resume_session_id:
                 cmd.extend(["--resume", resume_session_id])
             if model:
@@ -181,7 +186,18 @@ class CLISubscriptionEngine:
 
         self._prepare_cursor_cli_restrictions(cwd)
 
+        public_argv = argv[:-1] if argv else argv
+        logger.info(
+            "Starting CLI subscription provider=%s cwd=%s timeout=%ss argv=%s prompt_chars=%s",
+            cli_cfg.provider,
+            cwd,
+            cli_cfg.timeout_seconds,
+            public_argv,
+            len(argv[-1]) if argv else 0,
+        )
+
         async with self._semaphore:
+            proc = None
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *argv,
@@ -190,6 +206,7 @@ class CLISubscriptionEngine:
                     cwd=cwd,
                     env=os.environ.copy(),
                 )
+                logger.info("CLI process started pid=%s binary=%s", proc.pid, argv[0])
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
                     proc.communicate(),
                     timeout=cli_cfg.timeout_seconds,
@@ -201,9 +218,34 @@ class CLISubscriptionEngine:
                     f"or switch `engine.mode` to `sdk_apikey` in `config.yaml`."
                 )
             except asyncio.TimeoutError:
+                if proc and proc.returncode is None:
+                    logger.error(
+                        "CLI timed out after %ss; killing pid=%s",
+                        cli_cfg.timeout_seconds,
+                        proc.pid,
+                    )
+                    proc.kill()
+                    try:
+                        await proc.wait()
+                    except Exception:
+                        pass
                 raise RuntimeError(
-                    f"CLI Subscription engine (`{cli_cfg.provider}`) timed out after {cli_cfg.timeout_seconds}s."
+                    f"CLI Subscription engine (`{cli_cfg.provider}`) timed out after {cli_cfg.timeout_seconds}s. "
+                    f"Watch `pm2 logs` while it runs; Cursor may be waiting on network, login, or a prompt."
                 )
+
+        logger.info(
+            "CLI finished pid provider=%s exit=%s stdout_chars=%s stderr_chars=%s",
+            cli_cfg.provider,
+            proc.returncode,
+            len(stdout_bytes or b""),
+            len(stderr_bytes or b""),
+        )
+        if stderr_bytes:
+            logger.info(
+                "CLI stderr (redacted): %s",
+                redact_secrets(stderr_bytes.decode("utf-8", errors="replace"))[:4000],
+            )
 
         raw_stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
         raw_stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
