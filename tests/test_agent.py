@@ -18,7 +18,7 @@ from ops_toolkit import OpsToolkit
 
 
 def test_config_loads_and_validates() -> None:
-    cfg = load_config("config.yaml")
+    cfg = load_config("config.example.yaml")
     assert cfg.server_name == "prod-win-server-01"
     assert cfg.engine.mode == "cli_subscription"
     assert cfg.engine.cli_subscription.provider == "cursor"
@@ -69,7 +69,7 @@ def test_secret_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_cli_subscription_and_opencode_command_builders_with_sessions(tmp_path: Path) -> None:
-    cfg = load_config("config.yaml")
+    cfg = load_config("config.example.yaml")
     cfg.engine.session.state_db_file = str(tmp_path / "state.db")
     tk = OpsToolkit(cfg)
     cli_engine = CLISubscriptionEngine(cfg, tk)
@@ -213,7 +213,7 @@ def test_multi_file_action_logs_source_code_and_sqlite_actions(tmp_path: Path) -
     )
     (svc_dir / ".env").write_text("SECRET_KEY=do_not_read_me\n")
 
-    cfg = load_config("config.yaml")
+    cfg = load_config("config.example.yaml")
     cfg.engine.session.state_db_file = str(tmp_path / "state.db")
     cfg.services["test-svc"] = ServiceDefinition(
         name="test-svc",
@@ -262,7 +262,7 @@ def test_multi_file_action_logs_source_code_and_sqlite_actions(tmp_path: Path) -
 
 def test_router_mode_switch_persistence(tmp_path: Path) -> None:
     temp_cfg = tmp_path / "config.yaml"
-    temp_cfg.write_text(Path("config.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    temp_cfg.write_text(Path("config.example.yaml").read_text(encoding="utf-8"), encoding="utf-8")
 
     cfg = load_config(temp_cfg)
     cfg.engine.session.state_db_file = str(tmp_path / "state.db")
