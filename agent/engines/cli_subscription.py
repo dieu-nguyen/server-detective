@@ -79,13 +79,18 @@ class CLISubscriptionEngine:
                     if shutil.which(alt):
                         bin_parts = [alt]
                         break
-            cmd = [*bin_parts, "-p", prompt, "--output-format", "json"]
+            # `-p` / `--print` is a boolean flag; the prompt is a trailing argument.
+            # Flags after the prompt are ignored by Cursor CLI, so `--trust` never
+            # applied and PM2 still hit "Workspace Trust Required". On Windows
+            # `agent.cmd` they can also be truncated past cmd.exe's 8191-char limit.
+            cmd = [*bin_parts, "-p", "--output-format", "json"]
             if cli_cfg.trust_workspace:
                 cmd.append("--trust")
             if resume_session_id:
                 cmd.extend(["--resume", resume_session_id])
             if model:
                 cmd.extend(["--model", model])
+            cmd.append(prompt)
             return cmd
 
         if provider == "claude":
