@@ -79,7 +79,13 @@ def test_cli_subscription_and_opencode_command_builders_with_sessions(tmp_path: 
     cmd_cursor_new = cli_engine.build_command("check order-api-py", resume_session_id=None)
     assert "--output-format" in cmd_cursor_new
     assert "json" in cmd_cursor_new
+    assert "--trust" in cmd_cursor_new
     assert "--resume" not in cmd_cursor_new
+
+    cfg.engine.cli_subscription.trust_workspace = False
+    cmd_cursor_untrusted = cli_engine.build_command("check order-api-py", resume_session_id=None)
+    assert "--trust" not in cmd_cursor_untrusted
+    cfg.engine.cli_subscription.trust_workspace = True
 
     cmd_cursor_resume = cli_engine.build_command("check payment log", resume_session_id="chat_abc123")
     assert "--resume" in cmd_cursor_resume

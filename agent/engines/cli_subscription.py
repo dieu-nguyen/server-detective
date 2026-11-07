@@ -80,6 +80,8 @@ class CLISubscriptionEngine:
                         bin_parts = [alt]
                         break
             cmd = [*bin_parts, "-p", prompt, "--output-format", "json"]
+            if cli_cfg.trust_workspace:
+                cmd.append("--trust")
             if resume_session_id:
                 cmd.extend(["--resume", resume_session_id])
             if model:
