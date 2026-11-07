@@ -84,6 +84,8 @@ engine:
       codex: "codex"                # OpenAI Codex CLI (`codex`)
       gemini: "gemini"              # Google Gemini CLI (`gemini`)
     custom_command_template: []
+    # Required for PM2 / Telegram: Cursor CLI otherwise exits asking to trust the cwd.
+    trust_workspace: true
 
   # --- Mode B: SDK / API Key Configuration (OpenCode / Pi CLI Harness) ---
   sdk_apikey:
