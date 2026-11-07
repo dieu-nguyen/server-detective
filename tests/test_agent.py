@@ -81,6 +81,9 @@ def test_cli_subscription_and_opencode_command_builders_with_sessions(tmp_path: 
     assert "json" in cmd_cursor_new
     assert "--trust" in cmd_cursor_new
     assert "--resume" not in cmd_cursor_new
+    assert cmd_cursor_new[-1] == "check order-api-py"
+    assert cmd_cursor_new.index("--trust") < cmd_cursor_new.index("check order-api-py")
+    assert cmd_cursor_new.index("-p") < cmd_cursor_new.index("check order-api-py")
 
     cfg.engine.cli_subscription.trust_workspace = False
     cmd_cursor_untrusted = cli_engine.build_command("check order-api-py", resume_session_id=None)
@@ -90,6 +93,8 @@ def test_cli_subscription_and_opencode_command_builders_with_sessions(tmp_path: 
     cmd_cursor_resume = cli_engine.build_command("check payment log", resume_session_id="chat_abc123")
     assert "--resume" in cmd_cursor_resume
     assert "chat_abc123" in cmd_cursor_resume
+    assert cmd_cursor_resume.index("--resume") < cmd_cursor_resume.index("check payment log")
+    assert cmd_cursor_resume[-1] == "check payment log"
 
     # 2. OpenCode CLI (`sdk_apikey` mode) fresh vs resumed session
     cmd_oc_new = sdk_engine.build_opencode_command("inspect logs", resume_session_id=None)
