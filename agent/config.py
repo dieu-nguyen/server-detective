@@ -80,6 +80,9 @@ class CLISubscriptionConfig:
     trust_workspace: bool = True
     # Headless Telegram cannot answer Cursor's y/n command-approval prompts.
     force_allow_commands: bool = True
+    # Human-readable live log of assistant text + tool calls (empty string disables).
+    # Cursor print mode does not emit hidden chain-of-thought; this is the visible stream.
+    turn_log_file: str = "./logs/agent-turns.log"
 
 
 @dataclass
@@ -274,6 +277,7 @@ def load_config(config_path: str | Path = "config.yaml", env_path: Optional[str 
         custom_command_template=list(cli_raw.get("custom_command_template", []) or []),
         trust_workspace=bool(cli_raw.get("trust_workspace", True)),
         force_allow_commands=bool(cli_raw.get("force_allow_commands", True)),
+        turn_log_file=str(cli_raw.get("turn_log_file", "./logs/agent-turns.log") or ""),
     )
 
     sdk_cfg = SDKApiKeyConfig(

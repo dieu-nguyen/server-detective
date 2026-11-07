@@ -26,6 +26,115 @@ from agent.session_manager import parse_cli_json_output
 from ops_toolkit import OpsToolkit
 
 
+def _assistant_text_from_event(obj: Dict[str, Any]) -> str:
+    message = obj.get("message") or {}
+    content = message.get("content") if isinstance(message, dict) else None
+    if content is None:
+        content = obj.get("content") or obj.get("text") or obj.get("delta")
+    parts: List[str] = []
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("thinking") or ""))
+            else:
+                parts.append(str(item))
+    elif isinstance(content, str):
+        parts.append(content)
+    return "".join(parts)
+
+
+def _tool_call_summary(obj: Dict[str, Any]) -> str:
+    tool_call = obj.get("tool_call") or {}
+    if not isinstance(tool_call, dict):
+        return str(tool_call)[:300]
+    chunks: List[str] = []
+    for key, val in tool_call.items():
+        name = str(key).replace("ToolCall", "")
+        if isinstance(val, dict):
+            args = val.get("args") if isinstance(val.get("args"), dict) else {}
+            detail = (
+                args.get("path")
+                or args.get("command")
+                or args.get("query")
+                or args.get("pattern")
+                or ""
+            )
+            if key == "function":
+                name = str(val.get("name") or name)
+                detail = str(val.get("arguments") or detail)[:200]
+            chunks.append(f"{name} {detail}".strip())
+        else:
+            chunks.append(name)
+    return "; ".join(chunks) or "tool"
+
+
+def format_cli_stream_line(raw_line: str) -> Optional[str]:
+    """Turn one Cursor CLI stream-json line into a human-readable log line."""
+    line = (raw_line or "").strip()
+    if not line:
+        return None
+    try:
+        obj = json.loads(line)
+    except Exception:
+        return f"[stdout] {redact_secrets(line)[:800]}"
+    if not isinstance(obj, dict):
+        return None
+
+    event_type = str(obj.get("type") or "")
+    if event_type == "system":
+        return (
+            f"[system] model={obj.get('model') or ''} session={obj.get('session_id') or ''} "
+            f"cwd={obj.get('cwd') or ''}"
+        ).strip()
+    if event_type == "user":
+        return None
+    if event_type in ("thinking", "reasoning"):
+        text = redact_secrets(_assistant_text_from_event(obj) or str(obj.get("text") or "")).strip()
+        return f"[thinking] {text}" if text else None
+    if event_type == "assistant":
+        if obj.get("model_call_id"):
+            return None
+        text = redact_secrets(_assistant_text_from_event(obj)).strip()
+        return f"[assistant] {text}" if text else None
+    if event_type == "tool_call":
+        subtype = obj.get("subtype") or "event"
+        return f"[tool:{subtype}] {redact_secrets(_tool_call_summary(obj))}"
+    if event_type == "result":
+        return (
+            f"[result] duration_ms={obj.get('duration_ms')} session={obj.get('session_id') or ''} "
+            f"error={obj.get('is_error')}"
+        ).strip()
+    return f"[{event_type or 'event'}] {redact_secrets(line)[:400]}"
+
+
+class _TurnLog:
+    """Append-only, line-flushed turn log so `Get-Content -Wait` shows live output."""
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path) if path.strip() else None
+        self._fh = None
+
+    def __enter__(self) -> "_TurnLog":
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = self.path.open("a", encoding="utf-8")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._fh:
+            self._fh.close()
+            self._fh = None
+
+    def write(self, line: str) -> None:
+        text = (line or "").rstrip()
+        if not text:
+            return
+        logger.info("CLI turn %s", text[:800])
+        if self._fh:
+            self._fh.write(text + "\n")
+            self._fh.flush()
+
+
 class CLISubscriptionEngine:
     """Session-aware headless CLI bridge supporting Cursor (`agent` / `cursor-agent`), Claude (`claude`), Codex (`codex`), and Gemini (`gemini`)."""
 
@@ -86,7 +195,7 @@ class CLISubscriptionEngine:
             # Flags after the prompt are ignored by Cursor CLI, so `--trust` never
             # applied and PM2 still hit "Workspace Trust Required". On Windows
             # `agent.cmd` they can also be truncated past cmd.exe's 8191-char limit.
-            cmd = [*bin_parts, "-p", "--output-format", "json"]
+            cmd = [*bin_parts, "-p", "--output-format", "stream-json"]
             if cli_cfg.trust_workspace:
                 cmd.append("--trust")
             if cli_cfg.force_allow_commands:
@@ -196,56 +305,93 @@ class CLISubscriptionEngine:
             len(argv[-1]) if argv else 0,
         )
 
-        async with self._semaphore:
-            proc = None
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *argv,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=cwd,
-                    env=os.environ.copy(),
-                )
-                logger.info("CLI process started pid=%s binary=%s", proc.pid, argv[0])
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=cli_cfg.timeout_seconds,
-                )
-            except FileNotFoundError:
-                raise RuntimeError(
-                    f"CLI binary `{argv[0]}` was not found on PATH. "
-                    f"Verify that `{cli_cfg.provider}` CLI is installed and logged in on the server, "
-                    f"or switch `engine.mode` to `sdk_apikey` in `config.yaml`."
-                )
-            except asyncio.TimeoutError:
-                if proc and proc.returncode is None:
-                    logger.error(
-                        "CLI timed out after %ss; killing pid=%s",
-                        cli_cfg.timeout_seconds,
-                        proc.pid,
-                    )
-                    proc.kill()
-                    try:
-                        await proc.wait()
-                    except Exception:
-                        pass
-                raise RuntimeError(
-                    f"CLI Subscription engine (`{cli_cfg.provider}`) timed out after {cli_cfg.timeout_seconds}s. "
-                    f"Watch `pm2 logs` while it runs; Cursor may be waiting on network, login, or a prompt."
-                )
+        stdout_parts: List[bytes] = []
+        stderr_parts: List[bytes] = []
 
-        logger.info(
-            "CLI finished pid provider=%s exit=%s stdout_chars=%s stderr_chars=%s",
-            cli_cfg.provider,
-            proc.returncode,
-            len(stdout_bytes or b""),
-            len(stderr_bytes or b""),
-        )
-        if stderr_bytes:
-            logger.info(
-                "CLI stderr (redacted): %s",
-                redact_secrets(stderr_bytes.decode("utf-8", errors="replace"))[:4000],
+        async def _pump_stdout(proc: asyncio.subprocess.Process, turn_log: _TurnLog) -> None:
+            assert proc.stdout is not None
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                stdout_parts.append(line)
+                formatted = format_cli_stream_line(line.decode("utf-8", errors="replace"))
+                if formatted:
+                    turn_log.write(formatted)
+
+        async def _pump_stderr(proc: asyncio.subprocess.Process, turn_log: _TurnLog) -> None:
+            assert proc.stderr is not None
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                stderr_parts.append(line)
+                text = redact_secrets(line.decode("utf-8", errors="replace")).rstrip()
+                if text:
+                    turn_log.write(f"[stderr] {text}")
+
+        with _TurnLog(cli_cfg.turn_log_file) as turn_log:
+            turn_log.write(
+                f"======== TURN start provider={cli_cfg.provider} cwd={cwd} "
+                f"user=@{requester_username or requester_user_id or 'unknown'} "
+                f"question={redact_secrets(user_message)[:400]} ========"
             )
+            async with self._semaphore:
+                proc = None
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *argv,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=cwd,
+                        env=os.environ.copy(),
+                    )
+                    logger.info("CLI process started pid=%s binary=%s", proc.pid, argv[0])
+                    turn_log.write(f"[proc] pid={proc.pid} binary={argv[0]}")
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            _pump_stdout(proc, turn_log),
+                            _pump_stderr(proc, turn_log),
+                            proc.wait(),
+                        ),
+                        timeout=cli_cfg.timeout_seconds,
+                    )
+                except FileNotFoundError:
+                    raise RuntimeError(
+                        f"CLI binary `{argv[0]}` was not found on PATH. "
+                        f"Verify that `{cli_cfg.provider}` CLI is installed and logged in on the server, "
+                        f"or switch `engine.mode` to `sdk_apikey` in `config.yaml`."
+                    )
+                except asyncio.TimeoutError:
+                    if proc and proc.returncode is None:
+                        logger.error(
+                            "CLI timed out after %ss; killing pid=%s",
+                            cli_cfg.timeout_seconds,
+                            proc.pid,
+                        )
+                        turn_log.write(f"[timeout] killing pid={proc.pid} after {cli_cfg.timeout_seconds}s")
+                        proc.kill()
+                        try:
+                            await proc.wait()
+                        except Exception:
+                            pass
+                    raise RuntimeError(
+                        f"CLI Subscription engine (`{cli_cfg.provider}`) timed out after {cli_cfg.timeout_seconds}s. "
+                        f"Watch `{cli_cfg.turn_log_file or 'pm2 logs'}` while it runs."
+                    )
+
+            turn_log.write(f"======== TURN end exit={proc.returncode if proc else 'n/a'} ========")
+
+        stdout_bytes = b"".join(stdout_parts)
+        stderr_bytes = b"".join(stderr_parts)
+        logger.info(
+            "CLI finished provider=%s exit=%s stdout_chars=%s stderr_chars=%s log=%s",
+            cli_cfg.provider,
+            proc.returncode if proc else None,
+            len(stdout_bytes),
+            len(stderr_bytes),
+            cli_cfg.turn_log_file,
+        )
 
         raw_stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
         raw_stderr = stderr_bytes.decode("utf-8", errors="replace").strip()

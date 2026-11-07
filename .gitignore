@@ -13,4 +13,5 @@ agent_state.db
 agent_state.db-shm
 agent_state.db-wal
 audit.jsonl
+logs/
 .pytest_cache/

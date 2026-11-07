@@ -431,10 +431,11 @@ class TelegramOpsBot:
             if active_mode == "cli_subscription"
             else self.config.engine.sdk_apikey.timeout_seconds
         )
+        turn_log = self.config.engine.cli_subscription.turn_log_file or "pm2 logs"
         status_msg = await msg.reply_text(
             f"🔍 Investigating on `{self.config.server_name}` via `{active_mode}`...\n"
             f"_This stays here until Cursor CLI finishes (timeout {timeout_s}s). "
-            f"Watch `pm2 logs telegram-debug-agent` on the server._"
+            f"Live thinking/tools: `{turn_log}` (or `pm2 logs telegram-debug-agent`)._"
         )
         try:
             await chat.send_action(ChatAction.TYPING)
@@ -455,7 +456,7 @@ class TelegramOpsBot:
                         await status_msg.edit_text(
                             f"🔍 Investigating on `{self.config.server_name}` via `{active_mode}`...\n"
                             f"_Still running: {elapsed}s / {timeout_s}s. "
-                            f"Check `pm2 logs telegram-debug-agent`._"
+                            f"Tail `{turn_log}`._"
                         )
                     except Exception:
                         pass

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from agent.config import ServiceDefinition, load_config, save_engine_mode_to_config
-from agent.engines.cli_subscription import CLISubscriptionEngine
+from agent.engines.cli_subscription import CLISubscriptionEngine, format_cli_stream_line
 from agent.engines.router import EngineRouter
 from agent.engines.sdk_apikey import SDKApiKeyEngine
 from agent.security import redact_secrets, validate_readonly_sql
@@ -27,6 +27,7 @@ def test_config_loads_and_validates() -> None:
     assert cfg.engine.session.state_db_file == "./agent_state.db"
     assert cfg.engine.session.idle_timeout_minutes == 30
     assert cfg.engine.session.max_turns_per_session == 15
+    assert cfg.engine.cli_subscription.turn_log_file == "./logs/agent-turns.log"
     assert "order-api-py" in cfg.services
     assert "payment" in cfg.services["order-api-py"].log_files
     assert "webhook" in cfg.services["order-api-py"].log_files
@@ -78,7 +79,7 @@ def test_cli_subscription_and_opencode_command_builders_with_sessions(tmp_path: 
     # 1. Cursor CLI fresh vs resumed session
     cmd_cursor_new = cli_engine.build_command("check order-api-py", resume_session_id=None)
     assert "--output-format" in cmd_cursor_new
-    assert "json" in cmd_cursor_new
+    assert "stream-json" in cmd_cursor_new
     assert "--trust" in cmd_cursor_new
     assert "--resume" not in cmd_cursor_new
     assert cmd_cursor_new[-1] == "check order-api-py"
@@ -205,6 +206,38 @@ def test_parse_cli_json_output_formats() -> None:
     ans2, sid2 = parse_cli_json_output(opencode_raw)
     assert "Checked payment.log. Found 502 on line 88." == ans2
     assert sid2 == "ses_open_42"
+
+
+def test_format_cli_stream_line_assistant_tools_and_thinking() -> None:
+    assert format_cli_stream_line("") is None
+    assert format_cli_stream_line(
+        json.dumps({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "huge"}]}})
+    ) is None
+
+    thinking = format_cli_stream_line(json.dumps({"type": "thinking", "text": "Need to check payment.log"}))
+    assert thinking == "[thinking] Need to check payment.log"
+
+    assistant = format_cli_stream_line(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "I'll inspect logs"}]},
+            }
+        )
+    )
+    assert assistant == "[assistant] I'll inspect logs"
+    assert format_cli_stream_line(json.dumps({"type": "assistant", "model_call_id": "dup", "message": {"content": [{"type": "text", "text": "x"}]}})) is None
+
+    started = format_cli_stream_line(
+        json.dumps(
+            {
+                "type": "tool_call",
+                "subtype": "started",
+                "tool_call": {"readToolCall": {"args": {"path": "payment.log"}}},
+            }
+        )
+    )
+    assert started == "[tool:started] read payment.log"
 
 
 def test_multi_file_action_logs_source_code_and_sqlite_actions(tmp_path: Path) -> None:
