@@ -9,7 +9,13 @@ from pathlib import Path
 import pytest
 
 from agent.config import ServiceDefinition, load_config, save_engine_mode_to_config
-from agent.engines.cli_subscription import CLISubscriptionEngine
+from agent.engines.cli_subscription import CLISubscriptionEngine, format_cli_stream_line
+from agent.telegram_bot import (
+    TELEGRAM_MAX_CHUNKS,
+    TELEGRAM_MAX_LEN,
+    limit_telegram_chunks,
+    split_telegram_message,
+)
 from agent.engines.router import EngineRouter
 from agent.engines.sdk_apikey import SDKApiKeyEngine
 from agent.security import redact_secrets, validate_readonly_sql
@@ -27,6 +33,7 @@ def test_config_loads_and_validates() -> None:
     assert cfg.engine.session.state_db_file == "./agent_state.db"
     assert cfg.engine.session.idle_timeout_minutes == 30
     assert cfg.engine.session.max_turns_per_session == 15
+    assert cfg.engine.cli_subscription.turn_log_file == "./logs/agent-turns.log"
     assert "order-api-py" in cfg.services
     assert "payment" in cfg.services["order-api-py"].log_files
     assert "webhook" in cfg.services["order-api-py"].log_files
@@ -78,17 +85,24 @@ def test_cli_subscription_and_opencode_command_builders_with_sessions(tmp_path: 
     # 1. Cursor CLI fresh vs resumed session
     cmd_cursor_new = cli_engine.build_command("check order-api-py", resume_session_id=None)
     assert "--output-format" in cmd_cursor_new
-    assert "json" in cmd_cursor_new
+    assert "stream-json" in cmd_cursor_new
     assert "--trust" in cmd_cursor_new
     assert "--resume" not in cmd_cursor_new
     assert cmd_cursor_new[-1] == "check order-api-py"
     assert cmd_cursor_new.index("--trust") < cmd_cursor_new.index("check order-api-py")
+    assert cmd_cursor_new.index("--force") < cmd_cursor_new.index("check order-api-py")
+    assert cmd_cursor_new.index("--approve-mcps") < cmd_cursor_new.index("check order-api-py")
     assert cmd_cursor_new.index("-p") < cmd_cursor_new.index("check order-api-py")
 
     cfg.engine.cli_subscription.trust_workspace = False
     cmd_cursor_untrusted = cli_engine.build_command("check order-api-py", resume_session_id=None)
     assert "--trust" not in cmd_cursor_untrusted
     cfg.engine.cli_subscription.trust_workspace = True
+
+    cfg.engine.cli_subscription.force_allow_commands = False
+    cmd_cursor_no_force = cli_engine.build_command("check order-api-py", resume_session_id=None)
+    assert "--force" not in cmd_cursor_no_force
+    cfg.engine.cli_subscription.force_allow_commands = True
 
     cmd_cursor_resume = cli_engine.build_command("check payment log", resume_session_id="chat_abc123")
     assert "--resume" in cmd_cursor_resume
@@ -199,6 +213,51 @@ def test_parse_cli_json_output_formats() -> None:
     ans2, sid2 = parse_cli_json_output(opencode_raw)
     assert "Checked payment.log. Found 502 on line 88." == ans2
     assert sid2 == "ses_open_42"
+
+
+def test_telegram_chunks_split_and_cap_at_three() -> None:
+    short = split_telegram_message("hello")
+    assert short == ["hello"]
+    long_text = ("paragraph\n" * 2000)
+    chunks = split_telegram_message(long_text)
+    assert len(chunks) > TELEGRAM_MAX_CHUNKS
+    assert all(len(c) <= TELEGRAM_MAX_LEN for c in chunks)
+    limited = limit_telegram_chunks(chunks)
+    assert len(limited) == TELEGRAM_MAX_CHUNKS
+    assert "Truncated to 3 Telegram messages" in limited[-1]
+    assert all(len(c) <= TELEGRAM_MAX_LEN for c in limited)
+
+
+def test_format_cli_stream_line_assistant_tools_and_thinking() -> None:
+    assert format_cli_stream_line("") is None
+    assert format_cli_stream_line(
+        json.dumps({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "huge"}]}})
+    ) is None
+
+    thinking = format_cli_stream_line(json.dumps({"type": "thinking", "text": "Need to check payment.log"}))
+    assert thinking == "[thinking] Need to check payment.log"
+
+    assistant = format_cli_stream_line(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "I'll inspect logs"}]},
+            }
+        )
+    )
+    assert assistant == "[assistant] I'll inspect logs"
+    assert format_cli_stream_line(json.dumps({"type": "assistant", "model_call_id": "dup", "message": {"content": [{"type": "text", "text": "x"}]}})) is None
+
+    started = format_cli_stream_line(
+        json.dumps(
+            {
+                "type": "tool_call",
+                "subtype": "started",
+                "tool_call": {"readToolCall": {"args": {"path": "payment.log"}}},
+            }
+        )
+    )
+    assert started == "[tool:started] read payment.log"
 
 
 def test_multi_file_action_logs_source_code_and_sqlite_actions(tmp_path: Path) -> None:

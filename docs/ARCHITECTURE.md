@@ -8,7 +8,7 @@ It allows an engineering team to investigate outages, inspect **multiple action-
 
 ### Core Architectural Principles
 1. **Single Switch Linking Auth Mode & Execution Engine (`cli_subscription` vs. `sdk_apikey`):**
-   - `cli_subscription`: Uses a flat-rate monthly subscription (**Cursor CLI** default, or Claude Code / OpenAI Codex / Gemini CLI) by delegating the agentic reasoning loop to the official CLI binary (`agent -p --output-format json [--resume <id>]`).
+   - `cli_subscription`: Uses a flat-rate monthly subscription (**Cursor CLI** default, or Claude Code / OpenAI Codex / Gemini CLI) by delegating the agentic reasoning loop to the official CLI binary (`agent -p --output-format stream-json --trust --force --approve-mcps [--resume <id>]`). See **ADR-007** for headless flags, Telegram delivery, timeouts, and turn logs.
    - `sdk_apikey`: Uses a pay-as-you-go API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`) powered by the **OpenCode CLI harness** (`opencode run --format json [--session <id>]`), **Pi CLI** (`pi -p`), or the built-in in-memory Python async SDK loop.
 2. **SQLite-Backed Session Manager & Cross-Tool Session Porting (`agent/session_manager.py`):**
    - Stores all sessions, per-tool native CLI IDs (`cursor`, `claude`, `opencode`, `pi`), turn-by-turn message transcripts, pending approvals, and audit logs in a single ACID/WAL SQLite database (`agent_state.db`).
@@ -21,6 +21,7 @@ It allows an engineering team to investigate outages, inspect **multiple action-
    - Both engines can list all log files (`list_service_log_files`), tail/filter across one or all action logs (`get_service_logs`), and search/read source code jailed inside each service's `working_dir` (`search_service_code`, `read_service_code_file`).
 4. **Defense-in-Depth Safety:**
    - **Team RBAC:** Telegram group allowlist + `admins` and `viewers` roles.
+   - **Telegram is the operator interface (ADR-007):** Every successful turn and every engine/handler error is posted in Telegram. Disk logs are for tuning. Cursor CLI print mode skips workspace trust / y/n via `--trust --force --approve-mcps`; production restarts still use Telegram approval buttons.
    - **Zero Direct Destructive Execution:** Neither engine can restart a service or kill a query directly. Both call `propose_action`, which posts an interactive `[✅ Approve (Admins Only)]` / `[❌ Reject]` button in Telegram.
    - **Two-Layer Read-Only MySQL:** Database-level read-only user + Python SQL validator (`SELECT`, `SHOW`, `DESCRIBE`, `EXPLAIN` only, single-statement, auto `LIMIT`, session read-only transaction, and query timeout).
 

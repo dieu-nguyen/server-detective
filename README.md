@@ -44,6 +44,7 @@ A unified, session-aware Python debugging agent for **Windows Server** that lets
   - **[ADR-004: SQLite Session Lifecycle, 30-Minute Post-Response Idle Timer, `/session <id>` Reuse, and Cross-Tool Session Porting](docs/adr/ADR-004-sqlite-session-lifecycle-and-cross-tool-porting.md)**
   - **[ADR-005: Multi-File Action Log Discovery and Path-Jailed Source Code Inspection](docs/adr/ADR-005-multi-file-action-logs-and-jailed-code-inspection.md)**
   - **[ADR-006: Removing In-Memory Python SDK Loop in Favor of CLI Harnesses (`opencode` / `pi`) and Configurable Hard CLI Restrictions](docs/adr/ADR-006-cli-harnesses-only-and-configurable-restrictions.md)**
+  - **[ADR-007: Telegram as the Operator Interface, Headless Cursor CLI, and Server-Side Turn Logs](docs/adr/ADR-007-telegram-primary-interface-headless-cursor-cli.md)**
 
 ---
 
