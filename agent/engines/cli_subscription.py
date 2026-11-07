@@ -200,6 +200,8 @@ class CLISubscriptionEngine:
                 cmd.append("--trust")
             if cli_cfg.force_allow_commands:
                 cmd.append("--force")
+            if cli_cfg.approve_mcps:
+                cmd.append("--approve-mcps")
             if resume_session_id:
                 cmd.extend(["--resume", resume_session_id])
             if model:

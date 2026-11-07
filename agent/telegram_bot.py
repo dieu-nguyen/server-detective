@@ -30,6 +30,10 @@ from agent.security import AuditLogger, redact_secrets
 from ops_toolkit import OpsToolkit
 
 TELEGRAM_MAX_LEN = 3900
+TELEGRAM_MAX_CHUNKS = 3
+TELEGRAM_TRUNCATION_NOTE = (
+    "\n\n_(Truncated to 3 Telegram messages. Ask a follow-up for the rest.)_"
+)
 
 
 def split_telegram_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> List[str]:
@@ -47,6 +51,23 @@ def split_telegram_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> List[s
     if remaining:
         chunks.append(remaining)
     return chunks
+
+
+def limit_telegram_chunks(
+    chunks: List[str],
+    max_chunks: int = TELEGRAM_MAX_CHUNKS,
+    max_len: int = TELEGRAM_MAX_LEN,
+) -> List[str]:
+    """Keep at most `max_chunks` Telegram messages; note if the rest was dropped."""
+    if len(chunks) <= max_chunks:
+        return chunks
+    limited = list(chunks[:max_chunks])
+    last = limited[-1]
+    note = TELEGRAM_TRUNCATION_NOTE
+    if len(last) + len(note) > max_len:
+        last = last[: max(0, max_len - len(note))].rstrip()
+    limited[-1] = last + note
+    return limited
 
 
 def build_approval_keyboard(action_id: str) -> InlineKeyboardMarkup:
@@ -208,7 +229,7 @@ class TelegramOpsBot:
             return
         svc_res = await asyncio.to_thread(self.toolkit.list_registered_services_status)
         text = "🔧 **Registered Services Detail:**\n" + json.dumps(svc_res, indent=2, ensure_ascii=False)
-        for chunk in split_telegram_message(text):
+        for chunk in limit_telegram_chunks(split_telegram_message(text)):
             await update.effective_message.reply_text(chunk)
 
     async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -510,7 +531,7 @@ class TelegramOpsBot:
 
         header = f"🤖 **[{result.engine_used} • {result.provider_used}]**\n{session_badge}\n\n"
         full_reply = header + result.answer
-        chunks = split_telegram_message(full_reply)
+        chunks = limit_telegram_chunks(split_telegram_message(full_reply))
 
         footer_markup = (
             build_session_footer_keyboard(s_key)

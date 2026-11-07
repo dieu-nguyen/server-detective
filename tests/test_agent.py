@@ -10,6 +10,12 @@ import pytest
 
 from agent.config import ServiceDefinition, load_config, save_engine_mode_to_config
 from agent.engines.cli_subscription import CLISubscriptionEngine, format_cli_stream_line
+from agent.telegram_bot import (
+    TELEGRAM_MAX_CHUNKS,
+    TELEGRAM_MAX_LEN,
+    limit_telegram_chunks,
+    split_telegram_message,
+)
 from agent.engines.router import EngineRouter
 from agent.engines.sdk_apikey import SDKApiKeyEngine
 from agent.security import redact_secrets, validate_readonly_sql
@@ -85,6 +91,7 @@ def test_cli_subscription_and_opencode_command_builders_with_sessions(tmp_path: 
     assert cmd_cursor_new[-1] == "check order-api-py"
     assert cmd_cursor_new.index("--trust") < cmd_cursor_new.index("check order-api-py")
     assert cmd_cursor_new.index("--force") < cmd_cursor_new.index("check order-api-py")
+    assert cmd_cursor_new.index("--approve-mcps") < cmd_cursor_new.index("check order-api-py")
     assert cmd_cursor_new.index("-p") < cmd_cursor_new.index("check order-api-py")
 
     cfg.engine.cli_subscription.trust_workspace = False
@@ -206,6 +213,19 @@ def test_parse_cli_json_output_formats() -> None:
     ans2, sid2 = parse_cli_json_output(opencode_raw)
     assert "Checked payment.log. Found 502 on line 88." == ans2
     assert sid2 == "ses_open_42"
+
+
+def test_telegram_chunks_split_and_cap_at_three() -> None:
+    short = split_telegram_message("hello")
+    assert short == ["hello"]
+    long_text = ("paragraph\n" * 2000)
+    chunks = split_telegram_message(long_text)
+    assert len(chunks) > TELEGRAM_MAX_CHUNKS
+    assert all(len(c) <= TELEGRAM_MAX_LEN for c in chunks)
+    limited = limit_telegram_chunks(chunks)
+    assert len(limited) == TELEGRAM_MAX_CHUNKS
+    assert "Truncated to 3 Telegram messages" in limited[-1]
+    assert all(len(c) <= TELEGRAM_MAX_LEN for c in limited)
 
 
 def test_format_cli_stream_line_assistant_tools_and_thinking() -> None:
