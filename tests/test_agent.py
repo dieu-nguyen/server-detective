@@ -18,8 +18,10 @@ from agent.engines.cli_subscription import (
 from agent.telegram_bot import (
     TELEGRAM_MAX_CHUNKS,
     TELEGRAM_MAX_LEN,
+    html_to_plain,
     limit_telegram_chunks,
     split_telegram_message,
+    telegram_html,
 )
 from agent.engines.router import EngineRouter
 from agent.engines.sdk_apikey import SDKApiKeyEngine
@@ -265,6 +267,19 @@ def test_telegram_chunks_split_and_cap_at_three() -> None:
     assert len(limited) == TELEGRAM_MAX_CHUNKS
     assert "Truncated to 3 Telegram messages" in limited[-1]
     assert all(len(c) <= TELEGRAM_MAX_LEN for c in limited)
+
+
+def test_telegram_html_converts_markdown_asterisks() -> None:
+    header = "🤖 **[cli_subscription • cursor]**\nSession `s_410f3fbb`\n\npong"
+    rendered = telegram_html(header)
+    assert "**" not in rendered
+    assert "<b>[cli_subscription • cursor]</b>" in rendered
+    assert "<code>s_410f3fbb</code>" in rendered
+    assert "pong" in rendered
+    assert telegram_html("a < b") == "a &lt; b"
+    long_bold = "**" + ("x" * 500) + "**"
+    assert "<b>" not in telegram_html(long_bold)
+    assert html_to_plain("<b>[cli_subscription]</b>") == "[cli_subscription]"
 
 
 def test_format_cli_stream_line_assistant_tools_and_thinking() -> None:

@@ -14,7 +14,7 @@ The agent is deployed on a **Windows Server** under **PM2** and is invoked from 
 5. **Server-local `config.yaml`.** Telegram IDs, `binaries.cursor`, working dirs, and timeouts differ per machine. Tracking `config.yaml` in git caused deploys to overwrite server edits.
 6. **Telegram was not a complete interface.** The bot posted Investigating and then waited up to `timeout_seconds` (default **180s**) with no further chat update. Cursor stdout/stderr were buffered until exit. A failed `edit_text`, a CLI crash, or an unhandled handler exception could leave Investigating forever while the detail existed only in PM2 logs.
 7. **Operators asked for “thinking” like the Cursor desktop app.** Official Cursor CLI print-mode docs state that **`thinking` events are suppressed** in every `--output-format`. The closest substitute is `stream-json` assistant messages + tool-call events, written to a file for development/tuning—not as a substitute for the Telegram answer.
-8. **Long answers.** Telegram needs ~3900-character chunks. Unbounded splitting could spam many messages. Operators want a usable mobile reply of **at most 3 chunks**.
+8. **Long answers.** Telegram needs ~3500-character chunks. Unbounded splitting could spam many messages. Operators want a usable mobile reply of **at most 3 chunks**. Telegram HTML parse also rejects oversized **bold**/`code` entities (`Separator is found, but chunk is longer than limit`); that is not the 3-message cap.
 
 ## Decision
 
@@ -60,7 +60,7 @@ On Windows, Cursor CLI ships `agent.cmd` (a PowerShell launcher), not `agent.exe
 
 ### 5. Cap Telegram answers at 3 chunks
 
-- Chunk size remains **3900** characters (`split_telegram_message`).
+- Chunk size is **3500** characters (`split_telegram_message`) so HTML tags still fit Telegram’s 4096 limit. Inline **bold**/`code` spans longer than ~180 characters are left unformatted because Telegram rejects oversized parse entities (`Separator is found, but chunk is longer than limit`). The 3-message cap is separate and posts a truncation note.
 - System prompt: write for ~3 Telegram messages (root cause, a few file:line cites, next steps; no log dumps).
 - Hard cap: `limit_telegram_chunks` sends at most **3** messages and notes truncation on the last chunk.
 

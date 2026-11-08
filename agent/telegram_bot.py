@@ -7,16 +7,18 @@ Cross-Tool Session Porting, Audit Logging, and Interactive Admin Approval Button
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -32,11 +34,57 @@ from agent.engines.router import EngineRouter
 from agent.security import AuditLogger, redact_secrets
 from ops_toolkit import OpsToolkit
 
-TELEGRAM_MAX_LEN = 3900
+TELEGRAM_MAX_LEN = 3500
 TELEGRAM_MAX_CHUNKS = 3
+TELEGRAM_MAX_ENTITY = 180
 TELEGRAM_TRUNCATION_NOTE = (
     "\n\n_(Truncated to 3 Telegram messages. Ask a follow-up for the rest.)_"
 )
+
+
+def telegram_html(text: str) -> str:
+    """Escape HTML, then turn short Markdown **bold** / `code` into Telegram HTML.
+
+    Telegram rejects format entities that are too long ("Separator is found, but
+    chunk is longer than limit"). Only wrap short, single-line spans.
+    """
+    escaped = html.escape(text or "", quote=False)
+
+    def _short_span(match: re.Match[str], tag: str) -> str:
+        inner = match.group(1)
+        if len(inner) > TELEGRAM_MAX_ENTITY or "\n" in inner:
+            return match.group(0)
+        return f"<{tag}>{inner}</{tag}>"
+
+    max_ent = TELEGRAM_MAX_ENTITY
+    escaped = re.sub(
+        rf"\*\*([^*\n]{{1,{max_ent}}})\*\*",
+        lambda m: _short_span(m, "b"),
+        escaped,
+    )
+    escaped = re.sub(
+        rf"`([^`\n]{{1,{max_ent}}})`",
+        lambda m: _short_span(m, "code"),
+        escaped,
+    )
+    escaped = re.sub(
+        rf"(?<!\*)\*([^*\n]{{1,{max_ent}}})\*(?!\*)",
+        lambda m: _short_span(m, "i"),
+        escaped,
+    )
+    escaped = re.sub(
+        rf"(?<![A-Za-z0-9])_([^_\n]{{1,{max_ent}}})_(?![A-Za-z0-9])",
+        lambda m: _short_span(m, "i"),
+        escaped,
+    )
+    return escaped
+
+
+def html_to_plain(text: str) -> str:
+    """Strip tags for a parse_mode=None retry after Telegram HTML parse errors."""
+    plain = re.sub(r"<br\s*/?>", "\n", text or "", flags=re.IGNORECASE)
+    plain = re.sub(r"<[^>]+>", "", plain)
+    return html.unescape(plain)
 
 
 def split_telegram_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> List[str]:
@@ -427,6 +475,34 @@ class TelegramOpsBot:
 
         await self._process_question(update, text, override_mode=None)
 
+    async def _send_html_or_plain(
+        self,
+        sender: Any,
+        method: str,
+        text: str,
+        reply_markup: Any = None,
+    ) -> None:
+        """Send HTML, then retry as plain text if Telegram rejects oversized format entities."""
+        send = getattr(sender, method)
+        try:
+            return await send(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        except Exception as exc:
+            err = str(exc)
+            retry_plain = any(
+                needle in err
+                for needle in (
+                    "chunk is longer than limit",
+                    "Can't parse entities",
+                    "can't parse entities",
+                    "Unsupported start tag",
+                    "Unmatched",
+                )
+            )
+            if not retry_plain:
+                raise
+            logger.warning("Telegram HTML parse failed (%s); retrying as plain text", err)
+            return await send(html_to_plain(text), reply_markup=reply_markup)
+
     async def _deliver_chunks(
         self,
         status_msg: Any,
@@ -441,17 +517,17 @@ class TelegramOpsBot:
         posted = False
         if status_msg is not None:
             try:
-                await status_msg.edit_text(chunks[0], reply_markup=first_markup)
+                await self._send_html_or_plain(status_msg, "edit_text", chunks[0], first_markup)
                 posted = True
             except Exception:
                 logger.exception("Failed to edit Investigating message; sending a new reply")
         if not posted:
             if fallback_msg is None:
                 raise RuntimeError("No Telegram message available to deliver the agent result.")
-            await fallback_msg.reply_text(chunks[0], reply_markup=first_markup)
+            await self._send_html_or_plain(fallback_msg, "reply_text", chunks[0], first_markup)
         for index, extra in enumerate(chunks[1:]):
             markup = last_markup if index == len(chunks) - 2 else None
-            await fallback_msg.reply_text(extra, reply_markup=markup)
+            await self._send_html_or_plain(fallback_msg, "reply_text", extra, markup)
 
     async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Catch-all: any unhandled handler exception still gets a Telegram reply."""
@@ -461,7 +537,11 @@ class TelegramOpsBot:
         if target is None:
             return
         try:
-            await target.reply_text(f"❌ **Bot Error:**\n{err}"[:TELEGRAM_MAX_LEN])
+            await self._send_html_or_plain(
+                target,
+                "reply_text",
+                telegram_html(f"❌ Bot Error:\n{err}")[:TELEGRAM_MAX_LEN],
+            )
         except Exception:
             logger.exception("Failed to send Bot Error to Telegram")
 
@@ -508,9 +588,13 @@ class TelegramOpsBot:
                     if status_msg is None:
                         continue
                     try:
-                        await status_msg.edit_text(
-                            f"🔍 Investigating on `{self.config.server_name}` via `{active_mode}`...\n"
-                            f"_Still running: {elapsed}s / {timeout_s}s._"
+                        await self._send_html_or_plain(
+                            status_msg,
+                            "edit_text",
+                            telegram_html(
+                                f"🔍 Investigating on `{self.config.server_name}` via `{active_mode}`...\n"
+                                f"_Still running: {elapsed}s / {timeout_s}s._"
+                            ),
                         )
                     except Exception:
                         pass
@@ -521,9 +605,13 @@ class TelegramOpsBot:
 
         try:
             try:
-                status_msg = await msg.reply_text(
-                    f"🔍 Investigating on `{self.config.server_name}` via `{active_mode}`...\n"
-                    f"_Timeout {timeout_s}s. This message is replaced with the answer or any error._"
+                status_msg = await self._send_html_or_plain(
+                    msg,
+                    "reply_text",
+                    telegram_html(
+                        f"🔍 Investigating on `{self.config.server_name}` via `{active_mode}`...\n"
+                        f"_Timeout {timeout_s}s. This message is replaced with the answer or any error._"
+                    ),
                 )
             except Exception:
                 logger.exception("Failed to post Investigating status")
@@ -564,9 +652,12 @@ class TelegramOpsBot:
                     f"🔗 Resumed `{logical_id}` (native: `{native_short}` • Turn {result.session_turn}/{max_turns})"
                 )
 
-            header = f"🤖 **[{result.engine_used} • {result.provider_used}]**\n{session_badge}\n\n"
+            header = f"🤖 [{result.engine_used} • {result.provider_used}]\n{session_badge}\n\n"
             answer = (result.answer or "").strip() or "Investigation completed with no output."
-            chunks = limit_telegram_chunks(split_telegram_message(header + answer))
+            chunks = [
+                telegram_html(chunk)
+                for chunk in limit_telegram_chunks(split_telegram_message(header + answer))
+            ]
             footer_markup = (
                 build_session_footer_keyboard(s_key)
                 if self.config.engine.session.show_new_session_button
@@ -585,9 +676,11 @@ class TelegramOpsBot:
                     "_Only users listed in `telegram.admins` can approve this action._"
                 )
                 try:
-                    await msg.reply_text(
-                        card_text,
-                        reply_markup=build_approval_keyboard(action["action_id"]),
+                    await self._send_html_or_plain(
+                        msg,
+                        "reply_text",
+                        telegram_html(card_text),
+                        build_approval_keyboard(action["action_id"]),
                     )
                 except Exception:
                     logger.exception("Failed to post approval card %s", action.get("action_id"))
@@ -599,9 +692,12 @@ class TelegramOpsBot:
         except Exception as exc:
             err_text = redact_secrets(str(exc)) or "Unknown error"
             logger.exception("Agent turn failed; delivering error to Telegram")
-            error_chunks = limit_telegram_chunks(
-                split_telegram_message(f"❌ **Agent Error (`{active_mode}`):**\n{err_text}")
-            )
+            error_chunks = [
+                telegram_html(chunk)
+                for chunk in limit_telegram_chunks(
+                    split_telegram_message(f"❌ Agent Error (`{active_mode}`):\n{err_text}")
+                )
+            ]
             try:
                 await self._deliver_chunks(status_msg, msg, error_chunks)
             except Exception:
