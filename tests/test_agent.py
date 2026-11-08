@@ -18,6 +18,7 @@ from agent.engines.cli_subscription import (
 from agent.telegram_bot import (
     TELEGRAM_MAX_CHUNKS,
     TELEGRAM_MAX_LEN,
+    html_to_plain,
     limit_telegram_chunks,
     split_telegram_message,
     telegram_html,
@@ -276,6 +277,9 @@ def test_telegram_html_converts_markdown_asterisks() -> None:
     assert "<code>s_410f3fbb</code>" in rendered
     assert "pong" in rendered
     assert telegram_html("a < b") == "a &lt; b"
+    long_bold = "**" + ("x" * 500) + "**"
+    assert "<b>" not in telegram_html(long_bold)
+    assert html_to_plain("<b>[cli_subscription]</b>") == "[cli_subscription]"
 
 
 def test_format_cli_stream_line_assistant_tools_and_thinking() -> None:
