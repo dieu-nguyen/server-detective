@@ -25,6 +25,98 @@ from agent.security import redact_secrets
 from agent.session_manager import parse_cli_json_output
 from ops_toolkit import OpsToolkit
 
+_WINDOWS_LAUNCHER_NAMES = {
+    "agent.cmd",
+    "agent.bat",
+    "agent.ps1",
+    "cursor-agent.cmd",
+    "cursor-agent.bat",
+    "cursor-agent.ps1",
+}
+
+
+def _looks_like_windows_path(raw: str) -> bool:
+    return "\\" in raw or (len(raw) >= 2 and raw[1] == ":")
+
+
+def split_cli_binary(raw_bin: str) -> List[str]:
+    text = (raw_bin or "").strip()
+    if not text:
+        return ["agent"]
+    if _looks_like_windows_path(text) and " " not in text.strip('"'):
+        return [text.strip('"')]
+    return shlex.split(text, posix=not _looks_like_windows_path(text))
+
+
+def resolve_cursor_agent_node(root: Path) -> Optional[List[str]]:
+    """Prefer versions/<latest>/node.exe + index.js over agent.cmd (Windows Cursor CLI)."""
+    versions = Path(root) / "versions"
+    if not versions.is_dir():
+        return None
+    candidates: List[Path] = []
+    for entry in versions.iterdir():
+        if not entry.is_dir():
+            continue
+        node = entry / "node.exe"
+        index = entry / "index.js"
+        if node.is_file() and index.is_file():
+            candidates.append(entry)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda path: path.name, reverse=True)
+    latest = candidates[0]
+    return [str(latest / "node.exe"), str(latest / "index.js")]
+
+
+def resolve_cursor_bin_parts(raw_bin: str) -> List[str]:
+    """Resolve Cursor CLI argv, skipping the Windows .cmd/.ps1 launcher when possible."""
+    parts = split_cli_binary(raw_bin)
+    first = parts[0] if parts else "agent"
+    path = Path(first)
+    if not path.exists():
+        found = shutil.which(first)
+        if not found:
+            for alt in ("cursor-agent", "agent"):
+                found = shutil.which(alt)
+                if found:
+                    break
+        if found:
+            path = Path(found)
+            parts = [found]
+
+    name = path.name.lower()
+    if path.is_dir():
+        resolved = resolve_cursor_agent_node(path)
+        if resolved:
+            logger.info("Resolved Cursor CLI directory %s -> %s", path, resolved)
+            return resolved
+    if name in _WINDOWS_LAUNCHER_NAMES or name.endswith((".cmd", ".bat", ".ps1")):
+        resolved = resolve_cursor_agent_node(path.parent)
+        if resolved:
+            logger.info("Resolved Cursor CLI launcher %s -> %s", path, resolved)
+            return resolved
+    return parts
+
+
+def compose_cursor_turn_prompt(
+    user_message: str,
+    *,
+    is_resume: bool,
+    requester: str,
+    system_prompt: str = "",
+    history_block: str = "",
+) -> str:
+    """Put the Telegram question first and flatten newlines so Windows launchers cannot drop it."""
+    question = " ".join((user_message or "").split())
+    if is_resume:
+        return f"{question}\n\n[Follow-up from @{requester}]"
+    return (
+        f"{question}\n\n"
+        f"{system_prompt}\n\n"
+        f"--- Recent Conversation Context ---\n{history_block or '(New debugging session)'}\n\n"
+        f"--- Request from @{requester} ---"
+    )
+
 
 def _assistant_text_from_event(obj: Dict[str, Any]) -> str:
     message = obj.get("message") or {}
@@ -182,19 +274,11 @@ class CLISubscriptionEngine:
             ]
 
         raw_bin = cli_cfg.binaries.get(provider, provider)
-        bin_parts = shlex.split(raw_bin)
+        bin_parts = split_cli_binary(raw_bin)
 
         if provider == "cursor":
-            binary_name = bin_parts[0]
-            if len(bin_parts) == 1 and not shutil.which(binary_name):
-                for alt in ("cursor-agent", "agent"):
-                    if shutil.which(alt):
-                        bin_parts = [alt]
-                        break
+            bin_parts = resolve_cursor_bin_parts(raw_bin)
             # `-p` / `--print` is a boolean flag; the prompt is a trailing argument.
-            # Flags after the prompt are ignored by Cursor CLI, so `--trust` never
-            # applied and PM2 still hit "Workspace Trust Required". On Windows
-            # `agent.cmd` they can also be truncated past cmd.exe's 8191-char limit.
             cmd = [*bin_parts, "-p", "--output-format", "stream-json"]
             if cli_cfg.trust_workspace:
                 cmd.append("--trust")
@@ -268,24 +352,24 @@ class CLISubscriptionEngine:
     ) -> AgentTurnResult:
         cli_cfg = self.config.engine.cli_subscription
 
+        requester = requester_username or requester_user_id or "teammate"
         if resume_session_id:
-            composed_prompt = (
-                f"[Follow-up from @{requester_username or requester_user_id or 'teammate'}]:\n"
-                f"{user_message}"
+            composed_prompt = compose_cursor_turn_prompt(
+                user_message,
+                is_resume=True,
+                requester=str(requester),
             )
         else:
-            sys_prompt = build_system_prompt(self.config, include_cli_instructions=True)
             history_lines = []
             for msg in history[-6:]:
                 role = "User" if msg["role"] == "user" else "Agent"
                 history_lines.append(f"{role}: {msg['content']}")
-            history_block = "\n".join(history_lines)
-
-            composed_prompt = (
-                f"{sys_prompt}\n\n"
-                f"--- Recent Conversation Context ---\n{history_block or '(New debugging session)'}\n\n"
-                f"--- Request from @{requester_username or requester_user_id or 'teammate'} ---\n"
-                f"{user_message}"
+            composed_prompt = compose_cursor_turn_prompt(
+                user_message,
+                is_resume=False,
+                requester=str(requester),
+                system_prompt=build_system_prompt(self.config, include_cli_instructions=True),
+                history_block="\n".join(history_lines),
             )
 
         before_ids = {a["action_id"] for a in self.toolkit.action_store.list_pending()}
@@ -341,12 +425,17 @@ class CLISubscriptionEngine:
             async with self._semaphore:
                 proc = None
                 try:
+                    env = os.environ.copy()
+                    if argv and str(argv[0]).lower().endswith("node.exe"):
+                        env.setdefault("CURSOR_INVOKED_AS", "agent")
+                        cache_dir = Path.home() / "AppData" / "Local" / "cursor-compile-cache"
+                        env.setdefault("NODE_COMPILE_CACHE", str(cache_dir))
                     proc = await asyncio.create_subprocess_exec(
                         *argv,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                         cwd=cwd,
-                        env=os.environ.copy(),
+                        env=env,
                     )
                     logger.info("CLI process started pid=%s binary=%s", proc.pid, argv[0])
                     turn_log.write(f"[proc] pid={proc.pid} binary={argv[0]}")

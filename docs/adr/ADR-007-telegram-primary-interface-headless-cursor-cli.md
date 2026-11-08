@@ -44,7 +44,7 @@ agent -p --output-format stream-json --trust --force --approve-mcps [--resume <i
 
 This does **not** bypass the bot’s own Telegram `[Approve]` / `[Reject]` cards for `pm2 restart` / query kill (ADR-003).
 
-On Windows, `binaries.cursor` should be the **`.exe`** full path (forward slashes), configured on the server, not assumed from PATH.
+On Windows, Cursor CLI ships `agent.cmd` (a PowerShell launcher), not `agent.exe`. The bot resolves `agent.cmd` / `cursor-agent.cmd` to `versions/<latest>/node.exe` + `index.js` and launches that with `CreateProcess` so long prompts and newlines are not eaten by `cmd.exe`. The Telegram question is placed **first** in the prompt; follow-ups are flattened to one line.
 
 ### 3. Hard timeout; no silent hang
 
@@ -77,4 +77,4 @@ On Windows, `binaries.cursor` should be the **`.exe`** full path (forward slashe
 - **Negative / residual:** Hidden model reasoning is still unavailable in print mode. Tune from `agent-turns.log` + heartbeat, not a desktop-style thinking pane.
 - **Negative / residual:** `--force` auto-approves Cursor shell tools. Destructive production actions remain gated by Telegram admin buttons, not by Cursor’s y/n.
 - **Negative / residual:** A turn longer than `timeout_seconds` is killed; increase the config value when 3 minutes is too short.
-- **Negative / residual:** PM2 vs login-shell PATH and `.cmd` vs `.exe` remain an ops concern; document the full `agent.exe` path in server `config.yaml`.
+- **Negative / residual:** PM2 vs login-shell PATH remains an ops concern. Prefer a full path to `agent.cmd` in server `config.yaml`; the bot unwraps it to `node.exe` + `index.js`. If `versions/` is missing, it still falls back to the `.cmd` launcher.
