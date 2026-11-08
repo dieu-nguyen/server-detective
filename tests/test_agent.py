@@ -9,7 +9,12 @@ from pathlib import Path
 import pytest
 
 from agent.config import ServiceDefinition, load_config, save_engine_mode_to_config
-from agent.engines.cli_subscription import CLISubscriptionEngine, format_cli_stream_line
+from agent.engines.cli_subscription import (
+    CLISubscriptionEngine,
+    compose_cursor_turn_prompt,
+    format_cli_stream_line,
+    resolve_cursor_bin_parts,
+)
 from agent.telegram_bot import (
     TELEGRAM_MAX_CHUNKS,
     TELEGRAM_MAX_LEN,
@@ -109,6 +114,40 @@ def test_cli_subscription_and_opencode_command_builders_with_sessions(tmp_path: 
     assert "chat_abc123" in cmd_cursor_resume
     assert cmd_cursor_resume.index("--resume") < cmd_cursor_resume.index("check payment log")
     assert cmd_cursor_resume[-1] == "check payment log"
+
+    fake_root = tmp_path / "cursor-agent"
+    old_ver = fake_root / "versions" / "2026.01.01-aaa"
+    new_ver = fake_root / "versions" / "2026.11.08-bbb"
+    old_ver.mkdir(parents=True)
+    new_ver.mkdir(parents=True)
+    (fake_root / "agent.cmd").write_text("@echo off\n", encoding="utf-8")
+    for folder in (old_ver, new_ver):
+        (folder / "node.exe").write_bytes(b"")
+        (folder / "index.js").write_text("console.log('ok')\n", encoding="utf-8")
+    resolved = resolve_cursor_bin_parts(str(fake_root / "agent.cmd"))
+    assert resolved[0] == str(new_ver / "node.exe")
+    assert resolved[1] == str(new_ver / "index.js")
+    cfg.engine.cli_subscription.binaries["cursor"] = str(fake_root / "agent.cmd")
+    cmd_unwrapped = cli_engine.build_command("pong", resume_session_id=None)
+    assert cmd_unwrapped[0] == str(new_ver / "node.exe")
+    assert cmd_unwrapped[1] == str(new_ver / "index.js")
+    assert cmd_unwrapped[-1] == "pong"
+
+    first = compose_cursor_turn_prompt(
+        "answer with pong please",
+        is_resume=False,
+        requester="NamDCbi",
+        system_prompt="You are the ops agent.",
+        history_block="",
+    )
+    assert first.startswith("answer with pong please\n")
+    follow = compose_cursor_turn_prompt(
+        "look at\nudemy-run-tool",
+        is_resume=True,
+        requester="NamDCbi",
+    )
+    assert follow.startswith("look at udemy-run-tool\n")
+    assert "\nlook at" not in follow
 
     # 2. OpenCode CLI (`sdk_apikey` mode) fresh vs resumed session
     cmd_oc_new = sdk_engine.build_opencode_command("inspect logs", resume_session_id=None)

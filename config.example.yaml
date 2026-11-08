@@ -79,7 +79,8 @@ engine:
     max_concurrent_processes: 1     # Protects Windows Server from spawning multiple heavy CLI processes at once
     default_working_dir: "C:\\Services"
     binaries:
-      cursor: "agent"               # Cursor CLI binary (`agent` or `cursor-agent` or `wsl agent`)
+      cursor: "agent"               # `agent`, `cursor-agent`, or a full path to agent.cmd.
+                                    # On Windows the bot unwraps agent.cmd to versions/<latest>/node.exe + index.js.
       claude: "claude"              # Claude Code CLI (`claude`)
       codex: "codex"                # OpenAI Codex CLI (`codex`)
       gemini: "gemini"              # Google Gemini CLI (`gemini`)
