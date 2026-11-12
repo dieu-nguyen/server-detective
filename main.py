@@ -1,5 +1,5 @@
 """
-Main Entrypoint for the Windows Server Multi-Service Telegram Debug Agent.
+Main Entrypoint for server-detective.
 
 Usage:
     python main.py --config config.yaml
@@ -58,7 +58,7 @@ def run_preflight_check(config_path: str) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Windows Server Multi-Service Telegram Debug Agent")
+    parser = argparse.ArgumentParser(description="server-detective")
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
     parser.add_argument(
         "--check",
@@ -79,7 +79,7 @@ def main() -> int:
     bot = TelegramOpsBot(cfg)
     app = bot.build_application()
     logging.info(
-        "Starting Telegram Server Debug Agent for '%s' in mode='%s' (CLI='%s', SDK='%s/%s')...",
+        "Starting server-detective for '%s' in mode='%s' (CLI='%s', SDK='%s/%s')...",
         cfg.server_name,
         cfg.engine.mode,
         cfg.engine.cli_subscription.provider,
