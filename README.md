@@ -135,7 +135,7 @@ pip install -r requirements.txt
 Run the Telegram agent under your logged-in Windows user account via PM2:
 
 ```powershell
-pm2 start .\main.py --name "server-detective" --interpreter "C:\Services\server-detective\.venv\Scripts\python.exe" -- --config config.yaml
+pm2 start .\main.py --name "server-detective" --interpreter "C:\server-detective\.venv\Scripts\python.exe" -- --config config.yaml
 pm2 save
 ```
 
