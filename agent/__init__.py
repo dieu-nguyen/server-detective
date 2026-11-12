@@ -1,3 +1,3 @@
-"""Windows Server Multi-Service Telegram Debug Agent package."""
+"""server-detective package."""
 
 __version__ = "1.0.0"

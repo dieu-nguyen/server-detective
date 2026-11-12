@@ -1,8 +1,8 @@
-# System Architecture — Windows Server Multi-Service Telegram Debug Agent
+# System Architecture — server-detective
 
 ## 1. Overview & Goals
 
-The **Windows Server Multi-Service Telegram Debug Agent** is a Python daemon deployed directly on a Windows Server that hosts multiple Python services, a Node.js gateway, PM2, ngrok, n8n, and a MySQL database.
+**server-detective** is a Python daemon deployed directly on a Windows Server that hosts multiple Python services, a Node.js gateway, PM2, ngrok, n8n, and a MySQL database.
 
 It allows an engineering team to investigate outages, inspect **multiple action-specific log files**, search and read **service source code**, check tunnel/workflow health, run read-only database diagnostics, and safely trigger service restarts from mobile or desktop via **Telegram**—without needing to RDP or SSH into the Windows Server.
 

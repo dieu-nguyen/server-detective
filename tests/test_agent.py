@@ -1,4 +1,4 @@
-"""Unit and integration tests for Windows Server Multi-Service Telegram Debug Agent."""
+"""Unit and integration tests for server-detective."""
 
 from __future__ import annotations
 

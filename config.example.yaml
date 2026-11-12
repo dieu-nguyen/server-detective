@@ -1,5 +1,5 @@
 # ============================================================================
-# Windows Server Multi-Service Telegram Debug Agent — Configuration
+# server-detective — Configuration
 # ============================================================================
 # Copy or edit this file as `config.yaml` on your Windows Server.
 # Secrets (TELEGRAM_BOT_TOKEN, MYSQL_PASSWORD, API keys) are loaded from `.env`.

@@ -1,6 +1,6 @@
-# Windows Server Multi-Service Telegram Debug Agent
+# server-detective
 
-A unified, session-aware Python debugging agent for **Windows Server** that lets you and your teammates investigate services, inspect **multiple action-specific log files**, read and search **service source code**, check **PM2 / ngrok / n8n**, and run **read-only MySQL diagnostics** directly from **Telegram**.
+**server-detective** is a unified, session-aware Python debugging agent for **Windows Server** that lets you and your teammates investigate services, inspect **multiple action-specific log files**, read and search **service source code**, check **PM2 / ngrok / n8n**, and run **read-only MySQL diagnostics** directly from **Telegram**.
 
 ---
 
@@ -95,8 +95,8 @@ Open **PowerShell** on your Windows Server:
 
 ```powershell
 cd C:\Services
-git clone <your-repo-url> telegram-debug-agent
-cd C:\Services\telegram-debug-agent
+git clone <your-repo-url> server-detective
+cd C:\Services\server-detective
 
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -135,7 +135,7 @@ pip install -r requirements.txt
 Run the Telegram agent under your logged-in Windows user account via PM2:
 
 ```powershell
-pm2 start .\main.py --name "telegram-debug-agent" --interpreter "C:\Services\telegram-debug-agent\.venv\Scripts\python.exe" -- --config config.yaml
+pm2 start .\main.py --name "server-detective" --interpreter "C:\server-detective\.venv\Scripts\python.exe" -- --config config.yaml
 pm2 save
 ```
 

@@ -218,7 +218,7 @@ class TelegramOpsBot:
         sess_cfg = self.config.engine.session
 
         msg = (
-            f"🖥️ **{self.config.server_name} — Server Debug Agent**\n"
+            f"🖥️ **{self.config.server_name} — server-detective**\n"
             f"• **Your Role:** `{role}` (ID: `{user.id if user else ''}`)\n"
             f"• **Active Engine Mode:** `{mode}`\n"
             f"• **CLI Subscription Provider:** `{sub_provider}`\n"
