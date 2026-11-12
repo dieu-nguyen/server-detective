@@ -196,9 +196,10 @@ class TelegramOpsBot:
             chat_id=chat.id if chat else None,
         )
         if update.effective_message:
-            await update.effective_message.reply_text(
+            await self._reply_html(
+                update.effective_message,
                 f"⛔ Access denied. Your Telegram User ID (`{user.id if user else 'unknown'}`) "
-                f"or Chat ID (`{chat.id if chat else 'unknown'}`) is not in the authorized `config.yaml` allowlist."
+                f"or Chat ID (`{chat.id if chat else 'unknown'}`) is not in the authorized `config.yaml` allowlist.",
             )
 
     # -------------------------------------------------------------------------
@@ -239,7 +240,7 @@ class TelegramOpsBot:
             "• `/sdk <question>` — Force a single turn through SDK API Key mode"
         )
         if update.effective_message:
-            await update.effective_message.reply_text(msg)
+            await self._reply_html(update.effective_message, msg)
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._check_access(update):
@@ -270,7 +271,7 @@ class TelegramOpsBot:
             cats = ", ".join(s_info.get("log_categories") or []) or "default"
             lines.append(f"• `{s_name}` ({s_info.get('manager')}): state=`{state_str}`, health=`{hc_str}`, logs=`[{cats}]`")
 
-        await update.effective_message.reply_text("\n".join(lines))
+        await self._reply_html(update.effective_message, "\n".join(lines))
 
     async def cmd_services(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._check_access(update):
@@ -281,7 +282,7 @@ class TelegramOpsBot:
         svc_res = await asyncio.to_thread(self.toolkit.list_registered_services_status)
         text = "🔧 **Registered Services Detail:**\n" + json.dumps(svc_res, indent=2, ensure_ascii=False)
         for chunk in limit_telegram_chunks(split_telegram_message(text)):
-            await update.effective_message.reply_text(chunk)
+            await self._reply_html(update.effective_message, chunk)
 
     async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._check_access(update):
@@ -293,22 +294,29 @@ class TelegramOpsBot:
         args = context.args or []
         sdk_cfg = self.config.engine.sdk_apikey
         if not args:
-            await update.effective_message.reply_text(
+            await self._reply_html(
+                update.effective_message,
                 f"⚙️ **Current Engine Mode:** `{self.router.current_mode}`\n"
                 f"• CLI Subscription provider: `{self.config.engine.cli_subscription.provider}`\n"
                 f"• SDK API Key harness: `{sdk_cfg.harness}` (`{sdk_cfg.provider}/{sdk_cfg.model}`)\n\n"
                 "Admins can switch modes with:\n"
                 "• `/mode cli_subscription` (or `/mode cli`)\n"
-                "• `/mode sdk_apikey` (or `/mode sdk`)"
+                "• `/mode sdk_apikey` (or `/mode sdk`)",
             )
             return
 
         if not self.config.engine.allow_telegram_mode_switch:
-            await update.effective_message.reply_text("⚠️ Mode switching via Telegram is disabled in `config.yaml`.")
+            await self._reply_html(
+                update.effective_message,
+                "⚠️ Mode switching via Telegram is disabled in `config.yaml`.",
+            )
             return
 
         if not self.config.is_admin(update.effective_user.id):
-            await update.effective_message.reply_text("⛔ Only Admins can switch the default engine mode.")
+            await self._reply_html(
+                update.effective_message,
+                "⛔ Only Admins can switch the default engine mode.",
+            )
             return
 
         try:
@@ -320,12 +328,13 @@ class TelegramOpsBot:
                 chat_id=update.effective_chat.id if update.effective_chat else None,
                 engine_mode=new_mode,
             )
-            await update.effective_message.reply_text(
+            await self._reply_html(
+                update.effective_message,
                 f"✅ Engine mode switched to `{new_mode}` and saved to `{self.config.config_path}`.\n"
-                "*(Active sessions in SQLite will automatically port their context across tools!)*"
+                "*(Active sessions in SQLite will automatically port their context across tools!)*",
             )
         except ValueError as exc:
-            await update.effective_message.reply_text(f"❌ {exc}")
+            await self._reply_html(update.effective_message, f"❌ {exc}")
 
     async def cmd_new_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Start a brand-new debugging session (`/new` or `/clear`)."""
@@ -335,9 +344,10 @@ class TelegramOpsBot:
         s_key = self._session_key(update)
         self.router.reset_session(s_key)
         if update.effective_message:
-            await update.effective_message.reply_text(
+            await self._reply_html(
+                update.effective_message,
                 "🆕 **Started a fresh debugging session** for this chat/topic.\n"
-                "Your next message will begin a clean session (`turn 1`), while previous sessions remain saved in SQLite (`/session` to view or reuse)."
+                "Your next message will begin a clean session (`turn 1`), while previous sessions remain saved in SQLite (`/session` to view or reuse).",
             )
 
     async def cmd_session_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -360,9 +370,10 @@ class TelegramOpsBot:
             target_id = args[0].strip()
             resumed = self.router.reuse_session(s_key, target_id)
             if not resumed:
-                await update.effective_message.reply_text(
+                await self._reply_html(
+                    update.effective_message,
                     f"❌ Session `{target_id}` was not found in SQLite (`{sess_cfg.state_db_file}`).\n"
-                    "Run `/session` without arguments to see all saved session IDs."
+                    "Run `/session` without arguments to see all saved session IDs.",
                 )
                 return
 
@@ -382,13 +393,14 @@ class TelegramOpsBot:
                 if resumed.is_ported_across_tools
                 else ""
             )
-            await update.effective_message.reply_text(
+            await self._reply_html(
+                update.effective_message,
                 f"🔁 **Session `{resumed.session_id}` Reactivated!**\n"
                 f"• **Topic:** {resumed.title or '(Untitled)'}\n"
                 f"• **Turn Counter Reset:** `0 / {sess_cfg.max_turns_per_session}` (Total historical turns: `{resumed.total_turns_ever}`)\n"
                 f"• **Idle Timer Reset:** `0.0m / {sess_cfg.idle_timeout_minutes}m`\n"
                 f"• **Linked Native Tool IDs:** {native_summary}"
-                f"{port_note}"
+                f"{port_note}",
             )
             return
 
@@ -432,22 +444,23 @@ class TelegramOpsBot:
                     f"[turns: `{r['total_turns_ever']}`, {age_str}]"
                 )
 
-        await update.effective_message.reply_text(
+        await self._reply_html(
+            update.effective_message,
             "\n".join(lines),
-            reply_markup=build_session_list_keyboard(s_key, recent),
+            build_session_list_keyboard(s_key, recent),
         )
 
     async def cmd_force_cli(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         prompt = " ".join(context.args or []).strip()
         if not prompt and update.effective_message:
-            await update.effective_message.reply_text("Usage: `/cli <your debugging question>`")
+            await self._reply_html(update.effective_message, "Usage: `/cli <your debugging question>`")
             return
         await self._process_question(update, prompt, override_mode="cli_subscription")
 
     async def cmd_force_sdk(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         prompt = " ".join(context.args or []).strip()
         if not prompt and update.effective_message:
-            await update.effective_message.reply_text("Usage: `/sdk <your debugging question>`")
+            await self._reply_html(update.effective_message, "Usage: `/sdk <your debugging question>`")
             return
         await self._process_question(update, prompt, override_mode="sdk_apikey")
 
@@ -474,6 +487,15 @@ class TelegramOpsBot:
                 return
 
         await self._process_question(update, text, override_mode=None)
+
+    async def _reply_html(self, message: Any, text: str, reply_markup: Any = None) -> None:
+        """Convert leftover Markdown to Telegram HTML and send (plain-text fallback on parse errors)."""
+        if message is None:
+            return
+        await self._send_html_or_plain(message, "reply_text", telegram_html(text), reply_markup)
+
+    async def _edit_html(self, query: Any, text: str, reply_markup: Any = None) -> None:
+        await self._send_html_or_plain(query, "edit_message_text", telegram_html(text), reply_markup)
 
     async def _send_html_or_plain(
         self,
@@ -736,9 +758,10 @@ class TelegramOpsBot:
             self.router.reset_session(payload)
             await query.answer("Started a fresh debugging session!")
             if query.message:
-                await query.message.reply_text(
+                await self._reply_html(
+                    query.message,
                     f"🆕 **New session started** by @{user.username or user.id}. "
-                    "The next question will start with a clean context (`turn 1`)."
+                    "The next question will start with a clean context (`turn 1`).",
                 )
             return
 
@@ -755,11 +778,12 @@ class TelegramOpsBot:
             sess_cfg = self.config.engine.session
             await query.answer(f"Resumed session {resumed.session_id}!")
             if query.message:
-                await query.message.reply_text(
+                await self._reply_html(
+                    query.message,
                     f"🔁 **Session `{resumed.session_id}` Reactivated** by @{user.username or user.id}!\n"
                     f"• **Topic:** {resumed.title or '(Untitled)'}\n"
                     f"• **Turn Counter Reset:** `0 / {sess_cfg.max_turns_per_session}`\n"
-                    f"• **Idle Timer Reset:** `0.0m / {sess_cfg.idle_timeout_minutes}m`"
+                    f"• **Idle Timer Reset:** `0.0m / {sess_cfg.idle_timeout_minutes}m`",
                 )
             return
 
@@ -784,8 +808,9 @@ class TelegramOpsBot:
                 details={"action_id": action_id, "action": removed},
             )
             await query.answer("Action rejected.")
-            await query.edit_message_text(
-                f"❌ **Action `{action_id}` Rejected** by Admin @{user.username or user.id}."
+            await self._edit_html(
+                query,
+                f"❌ **Action `{action_id}` Rejected** by Admin @{user.username or user.id}.",
             )
             return
 
@@ -801,11 +826,12 @@ class TelegramOpsBot:
             action_info = exec_res.get("action") or {}
             status_icon = "✅" if exec_res.get("ok") else "⚠️"
             output_preview = (exec_res.get("output") or exec_res.get("error") or "Done")[:1000]
-            await query.edit_message_text(
+            await self._edit_html(
+                query,
                 f"{status_icon} **Action `{action_id}` Executed**\n"
                 f"• **Operation:** `{action_info.get('action_type', 'unknown')}` on `{action_info.get('target', '')}`\n"
                 f"• **Approved by:** @{user.username or user.id}\n"
-                f"• **Output:**\n```\n{output_preview}\n```"
+                f"• **Output:**\n```\n{output_preview}\n```",
             )
 
     def build_application(self) -> Application:
