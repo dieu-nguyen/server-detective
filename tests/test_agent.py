@@ -280,6 +280,11 @@ def test_telegram_html_converts_markdown_asterisks() -> None:
     long_bold = "**" + ("x" * 500) + "**"
     assert "<b>" not in telegram_html(long_bold)
     assert html_to_plain("<b>[cli_subscription]</b>") == "[cli_subscription]"
+    start_header = telegram_html("**prod-win-server-01 — server-detective**\n• **Your Role:** `Admin`")
+    assert "**" not in start_header
+    assert "<b>prod-win-server-01 — server-detective</b>" in start_header
+    assert "<b>Your Role:</b>" in start_header
+    assert "<code>Admin</code>" in start_header
 
 
 def test_format_cli_stream_line_assistant_tools_and_thinking() -> None:
