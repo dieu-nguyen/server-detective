@@ -61,7 +61,7 @@ On Windows, Cursor CLI ships `agent.cmd` (a PowerShell launcher), not `agent.exe
 
 ### 5. Cap Telegram answers at 3 chunks
 
-- Chunk size is **3500** characters (`split_telegram_message`) so HTML tags still fit Telegram’s 4096 limit. Inline **bold**/`code` spans longer than ~180 characters are left unformatted because Telegram rejects oversized parse entities (`Separator is found, but chunk is longer than limit`). The 3-message cap is separate and posts a truncation note.
+- Chunk size is **3500** characters (`split_telegram_message`) so HTML tags still fit Telegram’s 4096 limit. Inline **bold**/`code` spans longer than ~80 UTF-16 code units are left unformatted. Wide tables (`|`) and long URLs are sent as plain text. If Telegram still rejects parse (`Separator is found, but chunk is longer than limit`), retry without `parse_mode` so the answer still lands. The 3-message cap is separate and posts a truncation note.
 - System prompt: write for ~3 Telegram messages (root cause, a few file:line cites, next steps; no log dumps).
 - Hard cap: `limit_telegram_chunks` sends at most **3** messages and notes truncation on the last chunk.
 

@@ -22,7 +22,9 @@ from agent.telegram_bot import (
     TELEGRAM_MAX_CHUNKS,
     TELEGRAM_MAX_LEN,
     html_to_plain,
+    is_telegram_parse_error,
     limit_telegram_chunks,
+    should_send_plain,
     split_telegram_message,
     telegram_html,
 )
@@ -290,6 +292,11 @@ def test_telegram_html_converts_markdown_asterisks() -> None:
     assert "<b>prod-win-server-01 — server-detective</b>" in start_header
     assert "<b>Your Role:</b>" in start_header
     assert "<code>Admin</code>" in start_header
+    table = "| Course | Enrolled |\n| **Mass A** | 12 |\nhttps://www.udemy.com/" + ("x" * 120)
+    assert should_send_plain(table)
+    rendered_table = telegram_html(table)
+    assert "<b>" not in rendered_table
+    assert is_telegram_parse_error(RuntimeError("Separator is found, but chunk is longer than limit"))
 
 
 def test_format_cli_stream_line_assistant_tools_and_thinking() -> None:

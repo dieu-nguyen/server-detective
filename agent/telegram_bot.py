@@ -36,48 +36,83 @@ from ops_toolkit import OpsToolkit
 
 TELEGRAM_MAX_LEN = 3500
 TELEGRAM_MAX_CHUNKS = 3
-TELEGRAM_MAX_ENTITY = 180
+TELEGRAM_MAX_ENTITY = 80
 TELEGRAM_TRUNCATION_NOTE = (
-    "\n\n_(Truncated to 3 Telegram messages. Ask a follow-up for the rest.)_"
+    "\n\n(Truncated to 3 Telegram messages. Ask a follow-up for the rest.)"
 )
+_LONG_URL_RE = re.compile(r"https?://\S{80,}", re.IGNORECASE)
+
+
+def _utf16_len(text: str) -> int:
+    return len((text or "").encode("utf-16-le")) // 2
+
+
+def should_send_plain(text: str) -> bool:
+    """Wide tables and long URLs make Telegram HTML/Markdown entity parsing fail."""
+    body = text or ""
+    if body.count("|") >= 3:
+        return True
+    if _LONG_URL_RE.search(body):
+        return True
+    return False
+
+
+def telegram_error_text(exc: BaseException) -> str:
+    parts = [str(exc), repr(exc)]
+    for attr in ("message", "description"):
+        val = getattr(exc, attr, None)
+        if val:
+            parts.append(str(val))
+    return " ".join(parts)
+
+
+def is_telegram_parse_error(exc: BaseException) -> bool:
+    err = telegram_error_text(exc).lower()
+    return any(
+        needle in err
+        for needle in (
+            "chunk is longer than limit",
+            "parse entities",
+            "can't parse",
+            "separator is found",
+            "unsupported start tag",
+            "unmatched",
+            "entity",
+        )
+    )
 
 
 def telegram_html(text: str) -> str:
     """Escape HTML, then turn short Markdown **bold** / `code` into Telegram HTML.
 
-    Telegram rejects format entities that are too long ("Separator is found, but
-    chunk is longer than limit"). Only wrap short, single-line spans.
+    Skip formatting on table rows and long-URL lines. Telegram rejects oversized
+    format entities ("Separator is found, but chunk is longer than limit").
     """
-    escaped = html.escape(text or "", quote=False)
 
     def _short_span(match: re.Match[str], tag: str) -> str:
         inner = match.group(1)
-        if len(inner) > TELEGRAM_MAX_ENTITY or "\n" in inner:
+        if "\n" in inner or _utf16_len(inner) > TELEGRAM_MAX_ENTITY:
             return match.group(0)
         return f"<{tag}>{inner}</{tag}>"
 
-    max_ent = TELEGRAM_MAX_ENTITY
-    escaped = re.sub(
-        rf"\*\*([^*\n]{{1,{max_ent}}})\*\*",
-        lambda m: _short_span(m, "b"),
-        escaped,
-    )
-    escaped = re.sub(
-        rf"`([^`\n]{{1,{max_ent}}})`",
-        lambda m: _short_span(m, "code"),
-        escaped,
-    )
-    escaped = re.sub(
-        rf"(?<!\*)\*([^*\n]{{1,{max_ent}}})\*(?!\*)",
-        lambda m: _short_span(m, "i"),
-        escaped,
-    )
-    escaped = re.sub(
-        rf"(?<![A-Za-z0-9])_([^_\n]{{1,{max_ent}}})_(?![A-Za-z0-9])",
-        lambda m: _short_span(m, "i"),
-        escaped,
-    )
-    return escaped
+    def _format_line(line: str) -> str:
+        escaped = html.escape(line, quote=False)
+        if escaped.count("|") >= 2 or _LONG_URL_RE.search(line):
+            return escaped
+        max_ent = TELEGRAM_MAX_ENTITY
+        escaped = re.sub(
+            rf"\*\*([^*\n]{{1,{max_ent}}})\*\*",
+            lambda m: _short_span(m, "b"),
+            escaped,
+        )
+        escaped = re.sub(
+            rf"`([^`\n]{{1,{max_ent}}})`",
+            lambda m: _short_span(m, "code"),
+            escaped,
+        )
+        return escaped
+
+    return "\n".join(_format_line(line) for line in (text or "").split("\n"))
 
 
 def html_to_plain(text: str) -> str:
@@ -504,26 +539,23 @@ class TelegramOpsBot:
         text: str,
         reply_markup: Any = None,
     ) -> None:
-        """Send HTML, then retry as plain text if Telegram rejects oversized format entities."""
+        """Send HTML when safe; always fall back to parse_mode=None so tables still arrive."""
         send = getattr(sender, method)
+        plain = html_to_plain(text)
+        if not should_send_plain(plain):
+            try:
+                return await send(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+            except Exception as exc:
+                if "not modified" in telegram_error_text(exc).lower():
+                    raise
+                logger.warning("Telegram HTML send failed (%s); retrying as plain text", telegram_error_text(exc))
         try:
-            return await send(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+            return await send(plain, reply_markup=reply_markup)
         except Exception as exc:
-            err = str(exc)
-            retry_plain = any(
-                needle in err
-                for needle in (
-                    "chunk is longer than limit",
-                    "Can't parse entities",
-                    "can't parse entities",
-                    "Unsupported start tag",
-                    "Unmatched",
-                )
-            )
-            if not retry_plain:
-                raise
-            logger.warning("Telegram HTML parse failed (%s); retrying as plain text", err)
-            return await send(html_to_plain(text), reply_markup=reply_markup)
+            if is_telegram_parse_error(exc) or "bad request" in telegram_error_text(exc).lower():
+                logger.warning("Telegram plain send failed (%s); sending truncated text", telegram_error_text(exc))
+                return await send(plain[:1500], reply_markup=reply_markup)
+            raise
 
     async def _deliver_chunks(
         self,
