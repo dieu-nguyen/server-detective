@@ -14,6 +14,7 @@ import logging
 import os
 import shlex
 import shutil
+import traceback
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -234,6 +235,12 @@ class StreamCoalescer:
         self._kind: Optional[str] = None
         self._buf = ""
 
+    def _safe_write(self, line: str) -> None:
+        try:
+            self._write(line)
+        except Exception:
+            logger.exception("Turn log write failed")
+
     def feed_raw(self, raw_line: str) -> None:
         parsed = parse_cli_stream_event(raw_line)
         if parsed is None:
@@ -248,13 +255,13 @@ class StreamCoalescer:
             self._emit_ready()
             return
         self.flush()
-        self._write(f"[{kind}] {body}".strip() if body else f"[{kind}]")
+        self._safe_write(f"[{kind}] {body}".strip() if body else f"[{kind}]")
 
     def _emit_ready(self) -> None:
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
             if line.strip():
-                self._write(f"[{self._kind}] {line.rstrip()}")
+                self._safe_write(f"[{self._kind}] {line.rstrip()}")
         while len(self._buf) >= self.WRAP_AT:
             cut = self._buf.rfind(" ", 0, self.WRAP_AT + 1)
             if cut < 40:
@@ -262,11 +269,11 @@ class StreamCoalescer:
             chunk = self._buf[:cut].rstrip()
             self._buf = self._buf[cut:].lstrip()
             if chunk:
-                self._write(f"[{self._kind}] {chunk}")
+                self._safe_write(f"[{self._kind}] {chunk}")
 
     def flush(self) -> None:
         if self._kind and self._buf.strip():
-            self._write(f"[{self._kind}] {self._buf.strip()}")
+            self._safe_write(f"[{self._kind}] {self._buf.strip()}")
         self._buf = ""
         self._kind = None
 
@@ -444,31 +451,50 @@ class CLISubscriptionEngine:
             turn_log: TurnLog,
         ) -> None:
             assert proc.stdout is not None
-            try:
-                while True:
+            while True:
+                try:
                     line = await proc.stdout.readline()
-                    if not line:
+                except Exception as exc:
+                    logger.exception("CLI stdout readline failed")
+                    turn_log.write(f"[stdout-read-error] {type(exc).__name__}: {exc}")
+                    if proc.returncode is not None:
                         break
-                    stdout_parts.append(line)
+                    await asyncio.sleep(0.1)
+                    continue
+                if not line:
+                    break
+                stdout_parts.append(line)
+                try:
                     coalescer.feed_raw(line.decode("utf-8", errors="replace"))
-            except Exception as exc:
-                logger.exception("CLI stdout pump failed")
-                turn_log.write(f"[stdout-pump-error] {type(exc).__name__}: {exc}")
+                except Exception as exc:
+                    logger.exception("CLI stdout format failed")
+                    detail = traceback.format_exc().replace("\n", " | ")[:800]
+                    turn_log.write(
+                        f"[stdout-format-error] {type(exc).__name__}: {exc} | {detail}"
+                    )
 
         async def _pump_stderr(proc: asyncio.subprocess.Process, turn_log: TurnLog) -> None:
             assert proc.stderr is not None
-            try:
-                while True:
+            while True:
+                try:
                     line = await proc.stderr.readline()
-                    if not line:
+                except Exception as exc:
+                    logger.exception("CLI stderr readline failed")
+                    turn_log.write(f"[stderr-read-error] {type(exc).__name__}: {exc}")
+                    if proc.returncode is not None:
                         break
-                    stderr_parts.append(line)
+                    await asyncio.sleep(0.1)
+                    continue
+                if not line:
+                    break
+                stderr_parts.append(line)
+                try:
                     text = redact_secrets(line.decode("utf-8", errors="replace")).rstrip()
                     if text:
                         turn_log.write(f"[stderr] {text}")
-            except Exception as exc:
-                logger.exception("CLI stderr pump failed")
-                turn_log.write(f"[stderr-pump-error] {type(exc).__name__}: {exc}")
+                except Exception as exc:
+                    logger.exception("CLI stderr format failed")
+                    turn_log.write(f"[stderr-format-error] {type(exc).__name__}: {exc}")
 
         with TurnLog(
             cli_cfg.turn_log_file,
