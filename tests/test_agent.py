@@ -298,6 +298,7 @@ def test_telegram_html_converts_markdown_asterisks() -> None:
     rendered_table = telegram_html(table)
     assert "<b>" not in rendered_table
     assert is_telegram_parse_error(RuntimeError("Separator is found, but chunk is longer than limit"))
+    assert is_telegram_parse_error(ValueError("Separator is not found, and chunk exceed the limit"))
     assert needs_answer_document(table)
     assert not needs_answer_document("pong")
     preview = answer_preview("🤖 [cli]\n\n", "row1\n" * 400)

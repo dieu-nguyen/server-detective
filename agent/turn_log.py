@@ -88,11 +88,15 @@ class TurnLog:
         if not text:
             return
         stamped = f"{format_turn_log_time(self.timezone)} {text}"
-        logger.info("CLI turn %s", stamped[:800])
-        if self._fh:
+        logger.debug("CLI turn %s", stamped[:800])
+        if not self._fh:
+            return
+        try:
             self._fh.write(stamped + "\n")
             self._fh.flush()
             self._maybe_rotate()
+        except Exception:
+            logger.exception("Failed to write turn log line")
 
     def write_lines(self, lines: Iterable[str]) -> None:
         for line in lines:

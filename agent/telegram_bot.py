@@ -77,9 +77,11 @@ def is_telegram_parse_error(exc: BaseException) -> bool:
         needle in err
         for needle in (
             "chunk is longer than limit",
+            "chunk exceed",
             "parse entities",
             "can't parse",
             "separator is found",
+            "separator is not found",
             "unsupported start tag",
             "unmatched",
             "entity",
@@ -595,20 +597,25 @@ class TelegramOpsBot:
             try:
                 return await send(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
             except Exception as exc:
-                if "not modified" in telegram_error_text(exc).lower():
-                    raise
                 err = telegram_error_text(exc)
+                if "not modified" in err.lower():
+                    return None
                 logger.warning("Telegram HTML send failed (%s); retrying as plain text", err)
                 self._write_turn_log([f"[telegram-error] html_send {err}"])
         try:
             return await send(plain, reply_markup=reply_markup)
         except Exception as exc:
-            if is_telegram_parse_error(exc) or "bad request" in telegram_error_text(exc).lower():
-                err = telegram_error_text(exc)
-                logger.warning("Telegram plain send failed (%s); sending truncated text", err)
-                self._write_turn_log([f"[telegram-error] plain_send {err}"])
+            err = telegram_error_text(exc)
+            logger.warning("Telegram plain send failed (%s); sending truncated text", err)
+            self._write_turn_log([f"[telegram-error] plain_send {err}"])
+            if "not modified" in err.lower():
+                return None
+            try:
                 return await send(plain[:1500], reply_markup=reply_markup)
-            raise
+            except Exception as exc2:
+                logger.exception("Telegram truncated send failed: %s", telegram_error_text(exc2))
+                self._write_turn_log([f"[telegram-error] truncated_send {telegram_error_text(exc2)}"])
+                return None
 
     async def _deliver_chunks(
         self,

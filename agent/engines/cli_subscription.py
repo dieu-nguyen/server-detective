@@ -441,25 +441,34 @@ class CLISubscriptionEngine:
         async def _pump_stdout(
             proc: asyncio.subprocess.Process,
             coalescer: StreamCoalescer,
+            turn_log: TurnLog,
         ) -> None:
             assert proc.stdout is not None
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    break
-                stdout_parts.append(line)
-                coalescer.feed_raw(line.decode("utf-8", errors="replace"))
+            try:
+                while True:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    stdout_parts.append(line)
+                    coalescer.feed_raw(line.decode("utf-8", errors="replace"))
+            except Exception as exc:
+                logger.exception("CLI stdout pump failed")
+                turn_log.write(f"[stdout-pump-error] {type(exc).__name__}: {exc}")
 
         async def _pump_stderr(proc: asyncio.subprocess.Process, turn_log: TurnLog) -> None:
             assert proc.stderr is not None
-            while True:
-                line = await proc.stderr.readline()
-                if not line:
-                    break
-                stderr_parts.append(line)
-                text = redact_secrets(line.decode("utf-8", errors="replace")).rstrip()
-                if text:
-                    turn_log.write(f"[stderr] {text}")
+            try:
+                while True:
+                    line = await proc.stderr.readline()
+                    if not line:
+                        break
+                    stderr_parts.append(line)
+                    text = redact_secrets(line.decode("utf-8", errors="replace")).rstrip()
+                    if text:
+                        turn_log.write(f"[stderr] {text}")
+            except Exception as exc:
+                logger.exception("CLI stderr pump failed")
+                turn_log.write(f"[stderr-pump-error] {type(exc).__name__}: {exc}")
 
         with TurnLog(
             cli_cfg.turn_log_file,
@@ -492,7 +501,7 @@ class CLISubscriptionEngine:
                     turn_log.write(f"[proc] pid={proc.pid} binary={argv[0]}")
                     await asyncio.wait_for(
                         asyncio.gather(
-                            _pump_stdout(proc, coalescer),
+                            _pump_stdout(proc, coalescer, turn_log),
                             _pump_stderr(proc, turn_log),
                             proc.wait(),
                         ),
@@ -522,6 +531,20 @@ class CLISubscriptionEngine:
                         f"CLI Subscription engine (`{cli_cfg.provider}`) timed out after {cli_cfg.timeout_seconds}s. "
                         f"Watch `{cli_cfg.turn_log_file or 'pm2 logs'}` while it runs."
                     )
+                except Exception as exc:
+                    coalescer.flush()
+                    turn_log.write(f"[cli-error] {type(exc).__name__}: {exc}")
+                    if proc and proc.returncode is None:
+                        try:
+                            proc.kill()
+                            await proc.wait()
+                        except Exception:
+                            pass
+                    if not stdout_parts:
+                        raise RuntimeError(
+                            f"CLI Subscription engine (`{cli_cfg.provider}`) failed: {exc}"
+                        ) from exc
+                    turn_log.write("[cli-error] continuing with partial stdout")
 
             coalescer.flush()
             turn_log.write(f"======== TURN end exit={proc.returncode if proc else 'n/a'} ========")
