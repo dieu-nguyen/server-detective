@@ -55,7 +55,8 @@ On Windows, Cursor CLI ships `agent.cmd` (a PowerShell launcher), not `agent.exe
 ### 4. Live turn log for development (not hidden CoT)
 
 - Switch Cursor print output to `--output-format stream-json`.
-- Stream stdout/stderr line-by-line into `engine.cli_subscription.turn_log_file` (default `./logs/agent-turns.log`): `[system]`, `[assistant]`, `[tool:started|completed]`, `[thinking]` **if** Cursor emits it, `[stderr]`, `[result]`.
+- Stream stdout/stderr into `engine.cli_subscription.turn_log_file` (default `./logs/agent-turns.log`). Each line is prefixed with local time (`timezone` in `config.yaml`). Consecutive `[thinking]` / `[assistant]` token events are joined into readable lines instead of one word per line.
+- Rotate the active file to `agent-turns.log.1` .. `.N` when it exceeds `turn_log_max_bytes` (default 5 MiB, 7 backups).
 - Cursor print mode still **omits** desktop-app chain-of-thought. Operators tail the file with `Get-Content .\logs\agent-turns.log -Wait -Tail 50`.
 
 ### 5. Cap Telegram answers at 3 chunks

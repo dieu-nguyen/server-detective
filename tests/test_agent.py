@@ -11,9 +11,12 @@ import pytest
 from agent.config import ServiceDefinition, load_config, save_engine_mode_to_config
 from agent.engines.cli_subscription import (
     CLISubscriptionEngine,
+    StreamCoalescer,
     compose_cursor_turn_prompt,
     format_cli_stream_line,
+    format_turn_log_time,
     resolve_cursor_bin_parts,
+    rotate_log_file,
 )
 from agent.telegram_bot import (
     TELEGRAM_MAX_CHUNKS,
@@ -41,6 +44,8 @@ def test_config_loads_and_validates() -> None:
     assert cfg.engine.session.idle_timeout_minutes == 30
     assert cfg.engine.session.max_turns_per_session == 15
     assert cfg.engine.cli_subscription.turn_log_file == "./logs/agent-turns.log"
+    assert cfg.engine.cli_subscription.turn_log_max_bytes == 5242880
+    assert cfg.engine.cli_subscription.turn_log_backup_count == 7
     assert "order-api-py" in cfg.services
     assert "payment" in cfg.services["order-api-py"].log_files
     assert "webhook" in cfg.services["order-api-py"].log_files
@@ -317,6 +322,31 @@ def test_format_cli_stream_line_assistant_tools_and_thinking() -> None:
         )
     )
     assert started == "[tool:started] read payment.log"
+
+    lines: list[str] = []
+    coalescer = StreamCoalescer(lines.append)
+    for token in ("The", " user", " wants", " me", " to", " check"):
+        coalescer.feed_raw(json.dumps({"type": "thinking", "text": token}))
+    coalescer.feed_raw(
+        json.dumps({"type": "system", "model": "Grok 4.5 High", "session_id": "abc", "cwd": "C:\\server-detective"})
+    )
+    coalescer.flush()
+    assert lines[0] == "[thinking] The user wants me to check"
+    assert lines[1].startswith("[system] model=Grok 4.5 High")
+
+    stamp = format_turn_log_time("Asia/Saigon")
+    assert len(stamp) >= 19
+    assert stamp[4] == "-" and stamp[7] == "-"
+
+
+def test_turn_log_file_rotates(tmp_path: Path) -> None:
+    log_path = tmp_path / "agent-turns.log"
+    log_path.write_text("current\n", encoding="utf-8")
+    (tmp_path / "agent-turns.log.1").write_text("old-1\n", encoding="utf-8")
+    rotate_log_file(log_path, backup_count=3)
+    assert not log_path.exists()
+    assert (tmp_path / "agent-turns.log.1").read_text(encoding="utf-8") == "current\n"
+    assert (tmp_path / "agent-turns.log.2").read_text(encoding="utf-8") == "old-1\n"
 
 
 def test_multi_file_action_logs_source_code_and_sqlite_actions(tmp_path: Path) -> None:
