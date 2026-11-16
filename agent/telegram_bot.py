@@ -77,9 +77,11 @@ def is_telegram_parse_error(exc: BaseException) -> bool:
         needle in err
         for needle in (
             "chunk is longer than limit",
+            "chunk exceed",
             "parse entities",
             "can't parse",
             "separator is found",
+            "separator is not found",
             "unsupported start tag",
             "unmatched",
             "entity",
@@ -152,6 +154,24 @@ def needs_answer_document(text: str) -> bool:
     if should_send_plain(body):
         return True
     return len(split_telegram_message(body)) > 1
+
+
+def investigating_status_text(
+    server_name: str,
+    mode: str,
+    timeout_s: int,
+    elapsed: Optional[int] = None,
+) -> str:
+    """Plain status for Telegram (no Markdown/HTML). Heartbeat used `_Still running_` and backticks, which Telegram rejected."""
+    if elapsed is None:
+        return (
+            f"Investigating on {server_name} via {mode}...\n"
+            f"Timeout {timeout_s}s. This message is replaced with the answer or any error."
+        )
+    return (
+        f"Investigating on {server_name} via {mode}...\n"
+        f"Still running: {elapsed}s / {timeout_s}s."
+    )
 
 
 def answer_preview(header: str, answer: str) -> str:
@@ -572,6 +592,17 @@ class TelegramOpsBot:
             caption=caption[:TELEGRAM_CAPTION_LEN],
         )
 
+    async def _send_plain(
+        self,
+        sender: Any,
+        method: str,
+        text: str,
+        reply_markup: Any = None,
+    ) -> Any:
+        """Send without parse_mode so Telegram does not split Markdown/HTML entities."""
+        send = getattr(sender, method)
+        return await send(text, reply_markup=reply_markup)
+
     async def _reply_html(self, message: Any, text: str, reply_markup: Any = None) -> None:
         """Convert leftover Markdown to Telegram HTML and send (plain-text fallback on parse errors)."""
         if message is None:
@@ -595,20 +626,25 @@ class TelegramOpsBot:
             try:
                 return await send(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
             except Exception as exc:
-                if "not modified" in telegram_error_text(exc).lower():
-                    raise
                 err = telegram_error_text(exc)
+                if "not modified" in err.lower():
+                    return None
                 logger.warning("Telegram HTML send failed (%s); retrying as plain text", err)
                 self._write_turn_log([f"[telegram-error] html_send {err}"])
         try:
             return await send(plain, reply_markup=reply_markup)
         except Exception as exc:
-            if is_telegram_parse_error(exc) or "bad request" in telegram_error_text(exc).lower():
-                err = telegram_error_text(exc)
-                logger.warning("Telegram plain send failed (%s); sending truncated text", err)
-                self._write_turn_log([f"[telegram-error] plain_send {err}"])
+            err = telegram_error_text(exc)
+            logger.warning("Telegram plain send failed (%s); sending truncated text", err)
+            self._write_turn_log([f"[telegram-error] plain_send {err}"])
+            if "not modified" in err.lower():
+                return None
+            try:
                 return await send(plain[:1500], reply_markup=reply_markup)
-            raise
+            except Exception as exc2:
+                logger.exception("Telegram truncated send failed: %s", telegram_error_text(exc2))
+                self._write_turn_log([f"[telegram-error] truncated_send {telegram_error_text(exc2)}"])
+                return None
 
     async def _deliver_chunks(
         self,
@@ -696,16 +732,21 @@ class TelegramOpsBot:
                     if status_msg is None:
                         continue
                     try:
-                        await self._send_html_or_plain(
+                        await self._send_plain(
                             status_msg,
                             "edit_text",
-                            telegram_html(
-                                f"🔍 Investigating on `{self.config.server_name}` via `{active_mode}`...\n"
-                                f"_Still running: {elapsed}s / {timeout_s}s._"
+                            investigating_status_text(
+                                self.config.server_name,
+                                active_mode,
+                                timeout_s,
+                                elapsed=elapsed,
                             ),
                         )
                     except Exception:
-                        pass
+                        logger.exception("Failed to update Investigating heartbeat")
+                        self._write_turn_log(
+                            ["[telegram-error] heartbeat edit failed; Cursor turn continues"]
+                        )
                     try:
                         await chat.send_action(ChatAction.TYPING)
                     except Exception:
@@ -713,12 +754,13 @@ class TelegramOpsBot:
 
         try:
             try:
-                status_msg = await self._send_html_or_plain(
+                status_msg = await self._send_plain(
                     msg,
                     "reply_text",
-                    telegram_html(
-                        f"🔍 Investigating on `{self.config.server_name}` via `{active_mode}`...\n"
-                        f"_Timeout {timeout_s}s. This message is replaced with the answer or any error._"
+                    investigating_status_text(
+                        self.config.server_name,
+                        active_mode,
+                        timeout_s,
                     ),
                 )
             except Exception:
