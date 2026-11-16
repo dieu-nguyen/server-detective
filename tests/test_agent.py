@@ -357,6 +357,19 @@ def test_format_cli_stream_line_assistant_tools_and_thinking() -> None:
     assert lines[0] == "[thinking] The user wants me to check"
     assert lines[1].startswith("[system] model=Grok 4.5 High")
 
+    raised = {"n": 0}
+
+    def boom(_line: str) -> None:
+        raised["n"] += 1
+        raise ValueError("Separator is not found, and chunk exceed the limit")
+
+    hardy = StreamCoalescer(boom)
+    hardy.feed_raw(json.dumps({"type": "thinking", "text": "one"}))
+    hardy.feed_raw(json.dumps({"type": "thinking", "text": " two"}))
+    hardy.feed_raw(json.dumps({"type": "system", "model": "x", "session_id": "s", "cwd": "."}))
+    hardy.flush()
+    assert raised["n"] >= 1
+
     stamp = format_turn_log_time("Asia/Saigon")
     assert len(stamp) >= 19
     assert stamp[4] == "-" and stamp[7] == "-"

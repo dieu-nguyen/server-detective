@@ -88,7 +88,6 @@ class TurnLog:
         if not text:
             return
         stamped = f"{format_turn_log_time(self.timezone)} {text}"
-        logger.debug("CLI turn %s", stamped[:800])
         if not self._fh:
             return
         try:
