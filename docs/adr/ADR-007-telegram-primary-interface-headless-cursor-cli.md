@@ -56,14 +56,15 @@ On Windows, Cursor CLI ships `agent.cmd` (a PowerShell launcher), not `agent.exe
 
 - Switch Cursor print output to `--output-format stream-json`.
 - Stream stdout/stderr into `engine.cli_subscription.turn_log_file` (default `./logs/agent-turns.log`). Each line is prefixed with local time (`timezone` in `config.yaml`). Consecutive `[thinking]` / `[assistant]` token events are joined into readable lines instead of one word per line.
+- After the CLI turn, append the Telegram answer (`[answer]`) and any send/handler error (`[telegram-error]`) to the same file so operators can debug without guessing what chat received.
 - Rotate the active file to `agent-turns.log.1` .. `.N` when it exceeds `turn_log_max_bytes` (default 5 MiB, 7 backups).
 - Cursor print mode still **omits** desktop-app chain-of-thought. Operators tail the file with `Get-Content .\logs\agent-turns.log -Wait -Tail 50`.
 
-### 5. Cap Telegram answers at 3 chunks
+### 5. Cap Telegram chat; attach long answers as a file
 
-- Chunk size is **3500** characters (`split_telegram_message`) so HTML tags still fit Telegram’s 4096 limit. Inline **bold**/`code` spans longer than ~180 characters are left unformatted because Telegram rejects oversized parse entities (`Separator is found, but chunk is longer than limit`). The 3-message cap is separate and posts a truncation note.
-- System prompt: write for ~3 Telegram messages (root cause, a few file:line cites, next steps; no log dumps).
-- Hard cap: `limit_telegram_chunks` sends at most **3** messages and notes truncation on the last chunk.
+- Chat messages stay short (preview ~1500 characters). Wide tables, long URLs, or anything over ~3500 characters is also sent as a **`.txt` document** so Telegram’s 4096-character / entity parser limits do not drop the evidence.
+- Inline **bold**/`code` spans longer than ~80 UTF-16 code units are left unformatted. If Telegram still rejects parse (`Separator is found, but chunk is longer than limit`), retry without `parse_mode`.
+- If the document attach fails, fall back to at most **3** chat chunks with a truncation note.
 
 ### 6. Do not track machine-local `config.yaml`
 
