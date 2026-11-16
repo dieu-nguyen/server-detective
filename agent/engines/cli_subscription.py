@@ -14,8 +14,10 @@ import logging
 import os
 import shlex
 import shutil
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -160,50 +162,156 @@ def _tool_call_summary(obj: Dict[str, Any]) -> str:
     return "; ".join(chunks) or "tool"
 
 
-def format_cli_stream_line(raw_line: str) -> Optional[str]:
-    """Turn one Cursor CLI stream-json line into a human-readable log line."""
+def parse_cli_stream_event(raw_line: str) -> Optional[Tuple[str, str]]:
+    """Parse one Cursor CLI stream-json line into (kind, body). Skip empty/user events."""
     line = (raw_line or "").strip()
     if not line:
         return None
     try:
         obj = json.loads(line)
     except Exception:
-        return f"[stdout] {redact_secrets(line)[:800]}"
+        return ("stdout", redact_secrets(line)[:800])
     if not isinstance(obj, dict):
         return None
 
     event_type = str(obj.get("type") or "")
     if event_type == "system":
-        return (
-            f"[system] model={obj.get('model') or ''} session={obj.get('session_id') or ''} "
+        body = (
+            f"model={obj.get('model') or ''} session={obj.get('session_id') or ''} "
             f"cwd={obj.get('cwd') or ''}"
         ).strip()
+        return ("system", body)
     if event_type == "user":
         return None
     if event_type in ("thinking", "reasoning"):
-        text = redact_secrets(_assistant_text_from_event(obj) or str(obj.get("text") or "")).strip()
-        return f"[thinking] {text}" if text else None
+        text = redact_secrets(_assistant_text_from_event(obj) or str(obj.get("text") or ""))
+        return ("thinking", text) if text else None
     if event_type == "assistant":
         if obj.get("model_call_id"):
             return None
-        text = redact_secrets(_assistant_text_from_event(obj)).strip()
-        return f"[assistant] {text}" if text else None
+        text = redact_secrets(_assistant_text_from_event(obj))
+        return ("assistant", text) if text else None
     if event_type == "tool_call":
         subtype = obj.get("subtype") or "event"
-        return f"[tool:{subtype}] {redact_secrets(_tool_call_summary(obj))}"
+        return (f"tool:{subtype}", redact_secrets(_tool_call_summary(obj)))
     if event_type == "result":
-        return (
-            f"[result] duration_ms={obj.get('duration_ms')} session={obj.get('session_id') or ''} "
+        body = (
+            f"duration_ms={obj.get('duration_ms')} session={obj.get('session_id') or ''} "
             f"error={obj.get('is_error')}"
         ).strip()
-    return f"[{event_type or 'event'}] {redact_secrets(line)[:400]}"
+        return ("result", body)
+    return (event_type or "event", redact_secrets(line)[:400])
+
+
+def format_cli_stream_line(raw_line: str) -> Optional[str]:
+    """Turn one Cursor CLI stream-json line into a human-readable log line."""
+    parsed = parse_cli_stream_event(raw_line)
+    if parsed is None:
+        return None
+    kind, body = parsed
+    return f"[{kind}] {body}".strip() if body else f"[{kind}]"
+
+
+def format_turn_log_time(tz_name: str) -> str:
+    """Local wall time for turn-log lines, e.g. 2026-11-16 22:03:15 +0700."""
+    try:
+        tz = ZoneInfo(tz_name) if tz_name else datetime.now().astimezone().tzinfo
+        now = datetime.now(tz)
+    except Exception:
+        now = datetime.now().astimezone()
+    return now.strftime("%Y-%m-%d %H:%M:%S %z")
+
+
+def rotate_log_file(path: Path, backup_count: int) -> None:
+    """Rename path -> path.1, path.1 -> path.2, ... dropping the oldest."""
+    if backup_count <= 0:
+        path.write_text("", encoding="utf-8")
+        return
+    oldest = Path(f"{path}.{backup_count}")
+    if oldest.exists():
+        oldest.unlink()
+    for index in range(backup_count - 1, 0, -1):
+        src = Path(f"{path}.{index}")
+        if src.exists():
+            src.replace(Path(f"{path}.{index + 1}"))
+    if path.exists():
+        path.replace(Path(f"{path}.1"))
+
+
+def _join_stream_delta(buf: str, text: str) -> str:
+    if not buf:
+        return text
+    if not text:
+        return buf
+    if buf[-1].isspace() or text[0].isspace():
+        return buf + text
+    if text[0] in ",.;:!?)]}'\"":
+        return buf + text
+    return buf + " " + text
+
+
+class StreamCoalescer:
+    """Join streamed thinking/assistant token events into readable log lines."""
+
+    COALESCE_KINDS = frozenset({"thinking", "assistant", "reasoning"})
+    WRAP_AT = 160
+
+    def __init__(self, write: Callable[[str], None]) -> None:
+        self._write = write
+        self._kind: Optional[str] = None
+        self._buf = ""
+
+    def feed_raw(self, raw_line: str) -> None:
+        parsed = parse_cli_stream_event(raw_line)
+        if parsed is None:
+            return
+        kind, body = parsed
+        log_kind = "thinking" if kind == "reasoning" else kind
+        if log_kind in self.COALESCE_KINDS:
+            if self._kind and log_kind != self._kind:
+                self.flush()
+            self._kind = log_kind
+            self._buf = _join_stream_delta(self._buf, body)
+            self._emit_ready()
+            return
+        self.flush()
+        self._write(f"[{kind}] {body}".strip() if body else f"[{kind}]")
+
+    def _emit_ready(self) -> None:
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                self._write(f"[{self._kind}] {line.rstrip()}")
+        while len(self._buf) >= self.WRAP_AT:
+            cut = self._buf.rfind(" ", 0, self.WRAP_AT + 1)
+            if cut < 40:
+                cut = self.WRAP_AT
+            chunk = self._buf[:cut].rstrip()
+            self._buf = self._buf[cut:].lstrip()
+            if chunk:
+                self._write(f"[{self._kind}] {chunk}")
+
+    def flush(self) -> None:
+        if self._kind and self._buf.strip():
+            self._write(f"[{self._kind}] {self._buf.strip()}")
+        self._buf = ""
+        self._kind = None
 
 
 class _TurnLog:
-    """Append-only, line-flushed turn log so `Get-Content -Wait` shows live output."""
+    """Line-flushed turn log with timestamps and size-based rotation."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(
+        self,
+        path: str,
+        timezone: str = "Asia/Saigon",
+        max_bytes: int = 5_242_880,
+        backup_count: int = 7,
+    ) -> None:
         self.path = Path(path) if path.strip() else None
+        self.timezone = timezone
+        self.max_bytes = max(0, int(max_bytes))
+        self.backup_count = max(0, int(backup_count))
         self._fh = None
 
     def __enter__(self) -> "_TurnLog":
@@ -221,10 +329,26 @@ class _TurnLog:
         text = (line or "").rstrip()
         if not text:
             return
-        logger.info("CLI turn %s", text[:800])
+        stamped = f"{format_turn_log_time(self.timezone)} {text}"
+        logger.info("CLI turn %s", stamped[:800])
         if self._fh:
-            self._fh.write(text + "\n")
+            self._fh.write(stamped + "\n")
             self._fh.flush()
+            self._maybe_rotate()
+
+    def _maybe_rotate(self) -> None:
+        if not self.path or not self._fh or self.max_bytes <= 0:
+            return
+        try:
+            size = self._fh.tell()
+        except Exception:
+            size = self.path.stat().st_size
+        if size < self.max_bytes:
+            return
+        self._fh.close()
+        self._fh = None
+        rotate_log_file(self.path, self.backup_count)
+        self._fh = self.path.open("a", encoding="utf-8")
 
 
 class CLISubscriptionEngine:
@@ -394,16 +518,17 @@ class CLISubscriptionEngine:
         stdout_parts: List[bytes] = []
         stderr_parts: List[bytes] = []
 
-        async def _pump_stdout(proc: asyncio.subprocess.Process, turn_log: _TurnLog) -> None:
+        async def _pump_stdout(
+            proc: asyncio.subprocess.Process,
+            coalescer: StreamCoalescer,
+        ) -> None:
             assert proc.stdout is not None
             while True:
                 line = await proc.stdout.readline()
                 if not line:
                     break
                 stdout_parts.append(line)
-                formatted = format_cli_stream_line(line.decode("utf-8", errors="replace"))
-                if formatted:
-                    turn_log.write(formatted)
+                coalescer.feed_raw(line.decode("utf-8", errors="replace"))
 
         async def _pump_stderr(proc: asyncio.subprocess.Process, turn_log: _TurnLog) -> None:
             assert proc.stderr is not None
@@ -416,7 +541,13 @@ class CLISubscriptionEngine:
                 if text:
                     turn_log.write(f"[stderr] {text}")
 
-        with _TurnLog(cli_cfg.turn_log_file) as turn_log:
+        with _TurnLog(
+            cli_cfg.turn_log_file,
+            timezone=self.config.timezone,
+            max_bytes=cli_cfg.turn_log_max_bytes,
+            backup_count=cli_cfg.turn_log_backup_count,
+        ) as turn_log:
+            coalescer = StreamCoalescer(turn_log.write)
             turn_log.write(
                 f"======== TURN start provider={cli_cfg.provider} cwd={cwd} "
                 f"user=@{requester_username or requester_user_id or 'unknown'} "
@@ -441,7 +572,7 @@ class CLISubscriptionEngine:
                     turn_log.write(f"[proc] pid={proc.pid} binary={argv[0]}")
                     await asyncio.wait_for(
                         asyncio.gather(
-                            _pump_stdout(proc, turn_log),
+                            _pump_stdout(proc, coalescer),
                             _pump_stderr(proc, turn_log),
                             proc.wait(),
                         ),
@@ -460,6 +591,7 @@ class CLISubscriptionEngine:
                             cli_cfg.timeout_seconds,
                             proc.pid,
                         )
+                        coalescer.flush()
                         turn_log.write(f"[timeout] killing pid={proc.pid} after {cli_cfg.timeout_seconds}s")
                         proc.kill()
                         try:
@@ -471,6 +603,7 @@ class CLISubscriptionEngine:
                         f"Watch `{cli_cfg.turn_log_file or 'pm2 logs'}` while it runs."
                     )
 
+            coalescer.flush()
             turn_log.write(f"======== TURN end exit={proc.returncode if proc else 'n/a'} ========")
 
         stdout_bytes = b"".join(stdout_parts)

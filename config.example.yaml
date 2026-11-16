@@ -94,7 +94,10 @@ engine:
     approve_mcps: true
     # Live assistant/tool stream (not hidden model reasoning — Cursor print mode omits that).
     # Tail on the server: Get-Content .\logs\agent-turns.log -Wait -Tail 50
+    # Rolled to agent-turns.log.1 .. .7 when the active file exceeds turn_log_max_bytes.
     turn_log_file: "./logs/agent-turns.log"
+    turn_log_max_bytes: 5242880
+    turn_log_backup_count: 7
 
   # --- Mode B: SDK / API Key Configuration (OpenCode / Pi CLI Harness) ---
   sdk_apikey:

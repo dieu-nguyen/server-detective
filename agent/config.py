@@ -85,6 +85,8 @@ class CLISubscriptionConfig:
     # Human-readable live log of assistant text + tool calls (empty string disables).
     # Cursor print mode does not emit hidden chain-of-thought; this is the visible stream.
     turn_log_file: str = "./logs/agent-turns.log"
+    turn_log_max_bytes: int = 5_242_880
+    turn_log_backup_count: int = 7
 
 
 @dataclass
@@ -281,6 +283,8 @@ def load_config(config_path: str | Path = "config.yaml", env_path: Optional[str 
         force_allow_commands=bool(cli_raw.get("force_allow_commands", True)),
         approve_mcps=bool(cli_raw.get("approve_mcps", True)),
         turn_log_file=str(cli_raw.get("turn_log_file", "./logs/agent-turns.log") or ""),
+        turn_log_max_bytes=int(cli_raw.get("turn_log_max_bytes", 5_242_880) or 0),
+        turn_log_backup_count=int(cli_raw.get("turn_log_backup_count", 7) or 0),
     )
 
     sdk_cfg = SDKApiKeyConfig(
