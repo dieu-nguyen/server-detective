@@ -14,15 +14,14 @@ import logging
 import os
 import shlex
 import shutil
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
 from agent.config import AppConfig
 from agent.engines.base import AgentTurnResult, build_system_prompt
+from agent.turn_log import TurnLog
 from agent.security import redact_secrets
 from agent.session_manager import parse_cli_json_output
 from ops_toolkit import OpsToolkit
@@ -212,32 +211,6 @@ def format_cli_stream_line(raw_line: str) -> Optional[str]:
     return f"[{kind}] {body}".strip() if body else f"[{kind}]"
 
 
-def format_turn_log_time(tz_name: str) -> str:
-    """Local wall time for turn-log lines, e.g. 2026-11-16 22:03:15 +0700."""
-    try:
-        tz = ZoneInfo(tz_name) if tz_name else datetime.now().astimezone().tzinfo
-        now = datetime.now(tz)
-    except Exception:
-        now = datetime.now().astimezone()
-    return now.strftime("%Y-%m-%d %H:%M:%S %z")
-
-
-def rotate_log_file(path: Path, backup_count: int) -> None:
-    """Rename path -> path.1, path.1 -> path.2, ... dropping the oldest."""
-    if backup_count <= 0:
-        path.write_text("", encoding="utf-8")
-        return
-    oldest = Path(f"{path}.{backup_count}")
-    if oldest.exists():
-        oldest.unlink()
-    for index in range(backup_count - 1, 0, -1):
-        src = Path(f"{path}.{index}")
-        if src.exists():
-            src.replace(Path(f"{path}.{index + 1}"))
-    if path.exists():
-        path.replace(Path(f"{path}.1"))
-
-
 def _join_stream_delta(buf: str, text: str) -> str:
     if not buf:
         return text
@@ -296,59 +269,6 @@ class StreamCoalescer:
             self._write(f"[{self._kind}] {self._buf.strip()}")
         self._buf = ""
         self._kind = None
-
-
-class _TurnLog:
-    """Line-flushed turn log with timestamps and size-based rotation."""
-
-    def __init__(
-        self,
-        path: str,
-        timezone: str = "Asia/Saigon",
-        max_bytes: int = 5_242_880,
-        backup_count: int = 7,
-    ) -> None:
-        self.path = Path(path) if path.strip() else None
-        self.timezone = timezone
-        self.max_bytes = max(0, int(max_bytes))
-        self.backup_count = max(0, int(backup_count))
-        self._fh = None
-
-    def __enter__(self) -> "_TurnLog":
-        if self.path:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._fh = self.path.open("a", encoding="utf-8")
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if self._fh:
-            self._fh.close()
-            self._fh = None
-
-    def write(self, line: str) -> None:
-        text = (line or "").rstrip()
-        if not text:
-            return
-        stamped = f"{format_turn_log_time(self.timezone)} {text}"
-        logger.info("CLI turn %s", stamped[:800])
-        if self._fh:
-            self._fh.write(stamped + "\n")
-            self._fh.flush()
-            self._maybe_rotate()
-
-    def _maybe_rotate(self) -> None:
-        if not self.path or not self._fh or self.max_bytes <= 0:
-            return
-        try:
-            size = self._fh.tell()
-        except Exception:
-            size = self.path.stat().st_size
-        if size < self.max_bytes:
-            return
-        self._fh.close()
-        self._fh = None
-        rotate_log_file(self.path, self.backup_count)
-        self._fh = self.path.open("a", encoding="utf-8")
 
 
 class CLISubscriptionEngine:
@@ -530,7 +450,7 @@ class CLISubscriptionEngine:
                 stdout_parts.append(line)
                 coalescer.feed_raw(line.decode("utf-8", errors="replace"))
 
-        async def _pump_stderr(proc: asyncio.subprocess.Process, turn_log: _TurnLog) -> None:
+        async def _pump_stderr(proc: asyncio.subprocess.Process, turn_log: TurnLog) -> None:
             assert proc.stderr is not None
             while True:
                 line = await proc.stderr.readline()
@@ -541,7 +461,7 @@ class CLISubscriptionEngine:
                 if text:
                     turn_log.write(f"[stderr] {text}")
 
-        with _TurnLog(
+        with TurnLog(
             cli_cfg.turn_log_file,
             timezone=self.config.timezone,
             max_bytes=cli_cfg.turn_log_max_bytes,

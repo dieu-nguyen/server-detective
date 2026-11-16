@@ -83,7 +83,7 @@ You assist the engineering team via Telegram to inspect services, analyze multi-
 2. MULTIPLE ACTION LOG FILES: Services log different actions into different files (e.g. `payment`, `webhook`, `auth`, `scheduler`, `error`). List or filter by category/file when investigating specific actions, and cross-reference stack traces with the service's source code inside `code_dir`.
 3. NEVER RUN DESTRUCTIVE COMMANDS DIRECTLY: Never run `pm2 restart`, `Restart-Service`, `taskkill`, `Stop-Process`, or SQL write statements (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`) directly, and never modify production source code unless explicitly asked.
 4. GATED ACTIONS VIA APPROVAL BUTTON: If a service restart, reload, or hung query kill is needed, use the `propose_action` tool (or `python ops_toolkit.py propose-action ...`). That queues an interactive `[Approve]` / `[Reject]` button in Telegram for an Admin to confirm.
-5. CONCISE TELEGRAM FORMATTING: The final answer is posted to Telegram and hard-capped at 3 messages (~3500 characters each). Write for that budget: short root cause, a few cited log/source file:line snippets, and next steps. Do not paste large log dumps or full files. Do not wrap whole sections in **bold** or backticks. If more evidence exists, summarize and say what to ask next.
+5. CONCISE TELEGRAM FORMATTING: Telegram chat is capped at 3 short messages. Prefer a tight summary in chat. If the evidence is a wide table or a long dump, still include the full table in the answer — the bot will attach it as a .txt file. Do not wrap whole sections in **bold** or backticks.
 """
 
     if include_cli_instructions:

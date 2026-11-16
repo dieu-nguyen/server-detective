@@ -14,20 +14,21 @@ from agent.engines.cli_subscription import (
     StreamCoalescer,
     compose_cursor_turn_prompt,
     format_cli_stream_line,
-    format_turn_log_time,
     resolve_cursor_bin_parts,
-    rotate_log_file,
 )
 from agent.telegram_bot import (
     TELEGRAM_MAX_CHUNKS,
     TELEGRAM_MAX_LEN,
+    answer_preview,
     html_to_plain,
     is_telegram_parse_error,
     limit_telegram_chunks,
+    needs_answer_document,
     should_send_plain,
     split_telegram_message,
     telegram_html,
 )
+from agent.turn_log import answer_log_lines, format_turn_log_time, rotate_log_file, write_turn_log
 from agent.engines.router import EngineRouter
 from agent.engines.sdk_apikey import SDKApiKeyEngine
 from agent.security import redact_secrets, validate_readonly_sql
@@ -297,6 +298,14 @@ def test_telegram_html_converts_markdown_asterisks() -> None:
     rendered_table = telegram_html(table)
     assert "<b>" not in rendered_table
     assert is_telegram_parse_error(RuntimeError("Separator is found, but chunk is longer than limit"))
+    assert needs_answer_document(table)
+    assert not needs_answer_document("pong")
+    preview = answer_preview("🤖 [cli]\n\n", "row1\n" * 400)
+    assert "Full answer attached" in preview
+    logged = answer_log_lines("hello\nworld", kind="answer")
+    assert logged[0].startswith("[telegram-answer] begin")
+    assert "[answer] hello" in logged
+    assert logged[-1] == "[telegram-answer] end"
 
 
 def test_format_cli_stream_line_assistant_tools_and_thinking() -> None:
@@ -354,6 +363,8 @@ def test_turn_log_file_rotates(tmp_path: Path) -> None:
     assert not log_path.exists()
     assert (tmp_path / "agent-turns.log.1").read_text(encoding="utf-8") == "current\n"
     assert (tmp_path / "agent-turns.log.2").read_text(encoding="utf-8") == "old-1\n"
+    write_turn_log(str(tmp_path / "live.log"), "Asia/Saigon", ["[telegram-error] boom"])
+    assert "[telegram-error] boom" in (tmp_path / "live.log").read_text(encoding="utf-8")
 
 
 def test_multi_file_action_logs_source_code_and_sqlite_actions(tmp_path: Path) -> None:

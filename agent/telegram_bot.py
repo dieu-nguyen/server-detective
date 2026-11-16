@@ -13,6 +13,8 @@ import logging
 import os
 import re
 import time
+from datetime import datetime
+from io import BytesIO
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -32,11 +34,14 @@ from telegram.ext import (
 from agent.config import AppConfig
 from agent.engines.router import EngineRouter
 from agent.security import AuditLogger, redact_secrets
+from agent.turn_log import answer_log_lines, write_turn_log
 from ops_toolkit import OpsToolkit
 
 TELEGRAM_MAX_LEN = 3500
 TELEGRAM_MAX_CHUNKS = 3
 TELEGRAM_MAX_ENTITY = 80
+TELEGRAM_PREVIEW_LEN = 1500
+TELEGRAM_CAPTION_LEN = 1024
 TELEGRAM_TRUNCATION_NOTE = (
     "\n\n(Truncated to 3 Telegram messages. Ask a follow-up for the rest.)"
 )
@@ -137,6 +142,27 @@ def split_telegram_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> List[s
     if remaining:
         chunks.append(remaining)
     return chunks
+
+
+def needs_answer_document(text: str) -> bool:
+    """Long replies and tables are more reliable as a .txt document than 3 chat bubbles."""
+    body = text or ""
+    if len(body) > TELEGRAM_MAX_LEN:
+        return True
+    if should_send_plain(body):
+        return True
+    return len(split_telegram_message(body)) > 1
+
+
+def answer_preview(header: str, answer: str) -> str:
+    body = (answer or "").strip()
+    snippet = body[:TELEGRAM_PREVIEW_LEN]
+    if len(body) > TELEGRAM_PREVIEW_LEN:
+        snippet = snippet.rstrip() + "\n…"
+    return (
+        f"{header}{snippet}\n\n"
+        f"Full answer attached as a .txt file ({len(body)} characters)."
+    )
 
 
 def limit_telegram_chunks(
@@ -523,6 +549,29 @@ class TelegramOpsBot:
 
         await self._process_question(update, text, override_mode=None)
 
+    def _write_turn_log(self, lines: List[str]) -> None:
+        cli_cfg = self.config.engine.cli_subscription
+        try:
+            write_turn_log(
+                cli_cfg.turn_log_file,
+                self.config.timezone,
+                lines,
+                max_bytes=cli_cfg.turn_log_max_bytes,
+                backup_count=cli_cfg.turn_log_backup_count,
+            )
+        except Exception:
+            logger.exception("Failed to write Telegram lines to turn log")
+
+    async def _send_answer_document(self, message: Any, filename: str, body: str, caption: str) -> None:
+        payload = BytesIO((body or "").encode("utf-8"))
+        payload.name = filename
+        payload.seek(0)
+        await message.reply_document(
+            document=payload,
+            filename=filename,
+            caption=caption[:TELEGRAM_CAPTION_LEN],
+        )
+
     async def _reply_html(self, message: Any, text: str, reply_markup: Any = None) -> None:
         """Convert leftover Markdown to Telegram HTML and send (plain-text fallback on parse errors)."""
         if message is None:
@@ -548,12 +597,16 @@ class TelegramOpsBot:
             except Exception as exc:
                 if "not modified" in telegram_error_text(exc).lower():
                     raise
-                logger.warning("Telegram HTML send failed (%s); retrying as plain text", telegram_error_text(exc))
+                err = telegram_error_text(exc)
+                logger.warning("Telegram HTML send failed (%s); retrying as plain text", err)
+                self._write_turn_log([f"[telegram-error] html_send {err}"])
         try:
             return await send(plain, reply_markup=reply_markup)
         except Exception as exc:
             if is_telegram_parse_error(exc) or "bad request" in telegram_error_text(exc).lower():
-                logger.warning("Telegram plain send failed (%s); sending truncated text", telegram_error_text(exc))
+                err = telegram_error_text(exc)
+                logger.warning("Telegram plain send failed (%s); sending truncated text", err)
+                self._write_turn_log([f"[telegram-error] plain_send {err}"])
                 return await send(plain[:1500], reply_markup=reply_markup)
             raise
 
@@ -587,6 +640,7 @@ class TelegramOpsBot:
         """Catch-all: any unhandled handler exception still gets a Telegram reply."""
         err = redact_secrets(str(getattr(context, "error", None) or "Unknown error"))
         logger.exception("Unhandled Telegram handler error: %s", err)
+        self._write_turn_log([f"[telegram-error] handler {err}"])
         target = update.effective_message if isinstance(update, Update) else None
         if target is None:
             return
@@ -708,16 +762,48 @@ class TelegramOpsBot:
 
             header = f"🤖 [{result.engine_used} • {result.provider_used}]\n{session_badge}\n\n"
             answer = (result.answer or "").strip() or "Investigation completed with no output."
-            chunks = [
-                telegram_html(chunk)
-                for chunk in limit_telegram_chunks(split_telegram_message(header + answer))
-            ]
+            full_text = redact_secrets(header + answer)
+            self._write_turn_log(answer_log_lines(full_text, kind="answer"))
             footer_markup = (
                 build_session_footer_keyboard(s_key)
                 if self.config.engine.session.show_new_session_button
                 else None
             )
-            await self._deliver_chunks(status_msg, msg, chunks, last_markup=footer_markup)
+            if needs_answer_document(full_text):
+                preview = answer_preview(header, answer)
+                self._write_turn_log(
+                    [f"[telegram] deliver=document chars={len(full_text)} preview_chars={len(preview)}"]
+                )
+                await self._deliver_chunks(
+                    status_msg,
+                    msg,
+                    [telegram_html(preview)],
+                    last_markup=footer_markup,
+                )
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                try:
+                    await self._send_answer_document(
+                        msg,
+                        f"server-detective-answer-{stamp}.txt",
+                        full_text,
+                        "Full server-detective answer (plain text).",
+                    )
+                except Exception as exc:
+                    err = telegram_error_text(exc)
+                    self._write_turn_log([f"[telegram-error] document_send {err}"])
+                    logger.exception("Failed to attach answer file; sending chat chunks")
+                    chunks = [
+                        telegram_html(chunk)
+                        for chunk in limit_telegram_chunks(split_telegram_message(full_text))
+                    ]
+                    await self._deliver_chunks(None, msg, chunks, last_markup=footer_markup)
+            else:
+                chunks = [
+                    telegram_html(chunk)
+                    for chunk in limit_telegram_chunks(split_telegram_message(full_text))
+                ]
+                self._write_turn_log([f"[telegram] deliver=chunks n={len(chunks)} chars={len(full_text)}"])
+                await self._deliver_chunks(status_msg, msg, chunks, last_markup=footer_markup)
 
             for action in result.pending_actions:
                 card_text = (
@@ -744,18 +830,21 @@ class TelegramOpsBot:
                         limit_telegram_chunks(split_telegram_message(card_text)),
                     )
         except Exception as exc:
-            err_text = redact_secrets(str(exc)) or "Unknown error"
+            err_text = redact_secrets(telegram_error_text(exc) or str(exc) or "Unknown error")
             logger.exception("Agent turn failed; delivering error to Telegram")
+            error_body = f"❌ Agent Error (`{active_mode}`):\n{err_text}"
+            self._write_turn_log(
+                [f"[telegram-error] {err_text}"] + answer_log_lines(error_body, kind="error")
+            )
             error_chunks = [
                 telegram_html(chunk)
-                for chunk in limit_telegram_chunks(
-                    split_telegram_message(f"❌ Agent Error (`{active_mode}`):\n{err_text}")
-                )
+                for chunk in limit_telegram_chunks(split_telegram_message(error_body))
             ]
             try:
                 await self._deliver_chunks(status_msg, msg, error_chunks)
             except Exception:
                 logger.exception("Failed to deliver agent error to Telegram")
+                self._write_turn_log(["[telegram-error] failed to deliver Agent Error to Telegram"])
         finally:
             stop_heartbeat.set()
             if heartbeat_task is not None:
