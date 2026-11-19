@@ -27,6 +27,16 @@ from agent.security import redact_secrets
 from agent.session_manager import parse_cli_json_output
 from ops_toolkit import OpsToolkit
 
+# asyncio StreamReader.readline() defaults to 64 KiB. Cursor stream-json tool
+# results (Format-List dumps, enroll tables) often exceed that and raise:
+#   ValueError: Separator is found, but chunk is longer than limit
+#   ValueError: Separator is not found, and chunk exceed the limit
+CLI_STREAM_LIMIT = 32 * 1024 * 1024
+_OVERSIZE_LINE_MARKERS = (
+    "chunk is longer than limit",
+    "chunk exceed the limit",
+)
+
 _WINDOWS_LAUNCHER_NAMES = {
     "agent.cmd",
     "agent.bat",
@@ -455,8 +465,15 @@ class CLISubscriptionEngine:
                 try:
                     line = await proc.stdout.readline()
                 except Exception as exc:
+                    err = str(exc)
                     logger.exception("CLI stdout readline failed")
-                    turn_log.write(f"[stdout-read-error] {type(exc).__name__}: {exc}")
+                    if any(marker in err for marker in _OVERSIZE_LINE_MARKERS):
+                        turn_log.write(
+                            f"[stdout-read-error] oversized stream-json line dropped ({err}). "
+                            "asyncio discarded that one tool payload; continuing."
+                        )
+                    else:
+                        turn_log.write(f"[stdout-read-error] {type(exc).__name__}: {exc}")
                     if proc.returncode is not None:
                         break
                     await asyncio.sleep(0.1)
@@ -522,6 +539,7 @@ class CLISubscriptionEngine:
                         stderr=asyncio.subprocess.PIPE,
                         cwd=cwd,
                         env=env,
+                        limit=CLI_STREAM_LIMIT,
                     )
                     logger.info("CLI process started pid=%s binary=%s", proc.pid, argv[0])
                     turn_log.write(f"[proc] pid={proc.pid} binary={argv[0]}")

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -10,6 +12,7 @@ import pytest
 
 from agent.config import ServiceDefinition, load_config, save_engine_mode_to_config
 from agent.engines.cli_subscription import (
+    CLI_STREAM_LIMIT,
     CLISubscriptionEngine,
     StreamCoalescer,
     compose_cursor_turn_prompt,
@@ -369,6 +372,22 @@ def test_format_cli_stream_line_assistant_tools_and_thinking() -> None:
     hardy.feed_raw(json.dumps({"type": "system", "model": "x", "session_id": "s", "cwd": "."}))
     hardy.flush()
     assert raised["n"] >= 1
+
+    async def _read_large_line() -> int:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('x' * 200000 + chr(10))",
+            stdout=asyncio.subprocess.PIPE,
+            limit=CLI_STREAM_LIMIT,
+        )
+        assert proc.stdout is not None
+        line = await proc.stdout.readline()
+        await proc.wait()
+        return len(line)
+
+    n = asyncio.run(_read_large_line())
+    assert n > 100_000
 
     stamp = format_turn_log_time("Asia/Saigon")
     assert len(stamp) >= 19
