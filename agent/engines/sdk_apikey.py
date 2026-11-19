@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.config import AppConfig
+from agent.engines.cli_subscription import CLI_STREAM_LIMIT
 from agent.engines.base import AgentTurnResult, build_system_prompt
 from agent.security import redact_secrets
 from agent.session_manager import parse_cli_json_output
@@ -160,6 +161,7 @@ class SDKApiKeyEngine:
                     stderr=asyncio.subprocess.PIPE,
                     cwd=cwd,
                     env=env,
+                    limit=CLI_STREAM_LIMIT,
                 )
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
                     proc.communicate(),
