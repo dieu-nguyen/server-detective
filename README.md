@@ -132,10 +132,29 @@ pip install -r requirements.txt
 
 ### Step 6: Run the Bot 24/7 with PM2
 
-Run the Telegram agent under your logged-in Windows user account via PM2:
+Run under the same Windows user that owns Cursor CLI login (and `PM2_HOME`). This repo includes `pm2.config.js`.
+
+**Option A — add it to an existing `E:\server\ecosystem.config.js` (recommended if a `.bat` already starts all apps):**
+
+```js
+...withCwd("C:/server-detective/pm2.config.js"),
+```
+
+Use your real clone path if it is not `C:\server-detective`. Then start only the new app once (so you do not duplicate the other services):
 
 ```powershell
-pm2 start .\main.py --name "server-detective" --interpreter "C:\server-detective\.venv\Scripts\python.exe" -- --config config.yaml
+cd /d E:\server
+pm2 start .\ecosystem.config.js --only server-detective
+pm2 save
+```
+
+After that, your startup `.bat` (`pm2 start .\ecosystem.config.js --env=production`) will start **server-detective** with everything else. Do not run two processes with the same `TELEGRAM_BOT_TOKEN`.
+
+**Option B — start this repo alone:**
+
+```powershell
+cd C:\server-detective
+pm2 start .\pm2.config.js
 pm2 save
 ```
 
